@@ -7,12 +7,15 @@ Minimal MicroPython dashboard for a motorized bike using Raspberry Pi Pico (RP20
 - Stable single-file implementation in `main.py`
 - RPM via interrupt + median period filtering
 - Speed via interrupt pulse counting + wheel-based km/h calculation
-- MAX6675 temperature reading (currently placeholder display `0C`)
+- MAX6675 temperature reading with live display + fault fallback (`TC ERR`)
 - SSD1306 128x64 OLED UI with:
 	- Top RPM bar (with tick marks + labels)
 	- Center big speed digits + `km/h`
 	- RPM number with `RPM` label
-	- On-device 5-button settings menu
+	- Bottom-left odometer (`x.x KM`, then whole km at higher values)
+	- Bottom-right temperature (`xxC` / `TC ERR`)
+	- On-device settings menu + long-press info screen
+	- Persistent settings/trip/odometer/runtime
 
 ## Hardware
 
@@ -41,6 +44,7 @@ Minimal MicroPython dashboard for a motorized bike using Raspberry Pi Pico (RP20
 ## Settings Menu
 
 - `OK`: open/close settings
+- Hold `OK` (~800ms): open/close info screen
 - `UP` / `DOWN`: select setting
 - `LEFT` / `RIGHT`: decrease/increase value
 - Bottom help line scrolls as one line
@@ -51,6 +55,17 @@ Current menu items:
 - `WHL` (wheel size, mm)
 - `SPPR` (speed pulses per wheel rev)
 - `RBAR` (RPM bar max)
+- `RSET` (restore defaults, 2-step OK confirm)
+- `TRIP` (read-only trip distance)
+- `TCLR` (clear trip, 2-step OK confirm)
+
+## Info Screen (Long Press OK)
+
+Shows:
+- Odometer
+- Trip distance
+- Engine runtime
+- Temperature / fault state
 
 ## Wheel Size Presets
 
@@ -66,5 +81,6 @@ Quick starting values for `WHL` / `WHEEL_SIZE_MM`:
 ## Notes
 
 - All tunable constants are grouped in the **USER SETTINGS** block at the top of `main.py`.
-- Designed to stay simple and finishable (v0.1).
+- Runtime persistence is stored in `dashboard_settings.json` on the Pico filesystem.
+- Designed to stay simple and finishable while keeping field-tuning practical.
 - See `DASHBOARD.md` for full details.

@@ -17,7 +17,7 @@ Current project documentation for the active `main.py` implementation.
 - **Top:** RPM horizontal bar with fill, tick marks, and numeric tick labels
 - **Top/Mid:** RPM number + `RPM` label
 - **Center/Bottom:** Large speed digits with `km/h` text to the right
-- **Bottom-left:** odometer (`x.x KM`)
+- **Bottom-left:** odometer (`x.x KM`, then whole `KM` at higher values)
 - **Bottom-right:** live temperature (`xxC`) or `TC ERR` on sensor fault
 
 ## Info Screen (Long Press)

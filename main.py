@@ -848,51 +848,64 @@ def update_display():
 # -----------------------------
 # Hardware init
 # -----------------------------
-i2c = I2C(I2C_ID, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=I2C_FREQ)
-oled = SSD1306(128, 64, i2c, OLED_ADDR)
+def init_hardware():
+    global i2c, oled, spi, thermocouple
 
-spi = SPI(
-    SPI_ID,
-    baudrate=4000000,
-    polarity=0,
-    phase=0,
-    sck=Pin(SPI_SCK),
-    mosi=Pin(SPI_MOSI),
-    miso=Pin(SPI_MISO),
-)
-thermocouple = MAX6675(spi, SPI_CS)
+    i2c = I2C(I2C_ID, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=I2C_FREQ)
+    oled = SSD1306(128, 64, i2c, OLED_ADDR)
 
-btn_up = Pin(BTN_UP_PIN, Pin.IN, Pin.PULL_UP)
-btn_down = Pin(BTN_DOWN_PIN, Pin.IN, Pin.PULL_UP)
-btn_left = Pin(BTN_LEFT_PIN, Pin.IN, Pin.PULL_UP)
-btn_right = Pin(BTN_RIGHT_PIN, Pin.IN, Pin.PULL_UP)
-btn_ok = Pin(BTN_OK_PIN, Pin.IN, Pin.PULL_UP)
-
-load_settings()
-
-rpm_pin = Pin(RPM_PIN, Pin.IN, Pin.PULL_DOWN)
-rpm_pin.irq(trigger=Pin.IRQ_RISING, handler=rpm_interrupt)
-
-spd_pin = Pin(SPD_PIN, Pin.IN, Pin.PULL_DOWN)
-spd_pin.irq(trigger=Pin.IRQ_RISING, handler=spd_interrupt)
+    spi = SPI(
+        SPI_ID,
+        baudrate=4000000,
+        polarity=0,
+        phase=0,
+        sck=Pin(SPI_SCK),
+        mosi=Pin(SPI_MOSI),
+        miso=Pin(SPI_MISO),
+    )
+    thermocouple = MAX6675(spi, SPI_CS)
 
 
-# -----------------------------
-# Timers
-# -----------------------------
-rpm_timer = Timer()
-rpm_timer.init(freq=RPM_UPDATE_HZ, callback=update_rpm)
+def init_buttons_and_inputs():
+    global btn_up, btn_down, btn_left, btn_right, btn_ok
+    global rpm_pin, spd_pin
 
-display_timer = Timer()
-display_timer.init(freq=DISPLAY_UPDATE_HZ, callback=display_tick)
+    btn_up = Pin(BTN_UP_PIN, Pin.IN, Pin.PULL_UP)
+    btn_down = Pin(BTN_DOWN_PIN, Pin.IN, Pin.PULL_UP)
+    btn_left = Pin(BTN_LEFT_PIN, Pin.IN, Pin.PULL_UP)
+    btn_right = Pin(BTN_RIGHT_PIN, Pin.IN, Pin.PULL_UP)
+    btn_ok = Pin(BTN_OK_PIN, Pin.IN, Pin.PULL_UP)
 
-print("Motorcycle dashboard started")
+    load_settings()
+
+    rpm_pin = Pin(RPM_PIN, Pin.IN, Pin.PULL_DOWN)
+    rpm_pin.irq(trigger=Pin.IRQ_RISING, handler=rpm_interrupt)
+
+    spd_pin = Pin(SPD_PIN, Pin.IN, Pin.PULL_DOWN)
+    spd_pin.irq(trigger=Pin.IRQ_RISING, handler=spd_interrupt)
 
 
-# -----------------------------
-# Main loop
-# -----------------------------
-try:
+def init_timers():
+    global rpm_timer, display_timer
+
+    rpm_timer = Timer()
+    rpm_timer.init(freq=RPM_UPDATE_HZ, callback=update_rpm)
+
+    display_timer = Timer()
+    display_timer.init(freq=DISPLAY_UPDATE_HZ, callback=display_tick)
+
+
+def update_sensors():
+    global temp
+    try:
+        temp = thermocouple.read_temp()
+    except Exception:
+        temp = None
+
+
+def run_dashboard_loop():
+    global display_due
+
     while True:
         handle_buttons()
         update_runtime()
@@ -901,17 +914,29 @@ try:
             display_due = False
             update_display()
 
-        try:
-            temp = thermocouple.read_temp()
-        except Exception:
-            temp = None
-
+        update_sensors()
         maybe_save_persistent_state()
         utime.sleep_ms(MAIN_LOOP_SLEEP_MS)
 
-except KeyboardInterrupt:
+
+def stop_dashboard():
     rpm_timer.deinit()
     display_timer.deinit()
     oled.fill(0)
     oled.show()
-    print("Dashboard stopped")
+
+
+def start_dashboard():
+    init_hardware()
+    init_buttons_and_inputs()
+    init_timers()
+    print("Motorcycle dashboard started")
+
+    try:
+        run_dashboard_loop()
+    except KeyboardInterrupt:
+        stop_dashboard()
+        print("Dashboard stopped")
+
+
+start_dashboard()
