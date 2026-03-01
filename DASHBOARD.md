@@ -1,4 +1,4 @@
-# Motorcycle Dashboard (RP2040 + SSD1306)
+# Motorcycle Dashboard (RP2040 + SSD1306/SSD1309)
 
 Current project documentation for the active `main.py` implementation.
 
@@ -6,7 +6,7 @@ Current project documentation for the active `main.py` implementation.
 
 - Single-file MicroPython dashboard (`main.py`)
 - Raspberry Pi Pico (RP2040)
-- SSD1306 128x64 OLED over I2C
+- SSD1306/SSD1309 128x64 OLED over I2C
 - RPM input via GPIO interrupt (inductive pickup front-end)
 - Speed input via GPIO interrupt
 - MAX6675 over SPI (live temperature display with fault fallback)
@@ -17,7 +17,7 @@ Current project documentation for the active `main.py` implementation.
 - **Top:** RPM horizontal bar with fill, tick marks, and numeric tick labels
 - **Top/Mid:** RPM number + `RPM` label
 - **Center/Bottom:** Large speed digits with `km/h` text to the right
-- **Bottom-left:** odometer (`x.x KM`, then whole `KM` at higher values)
+- **Bottom-left:** odometer (whole km value)
 - **Bottom-right:** live temperature (`xxC`) or `TC ERR` on sensor fault
 
 ## Info Screen (Long Press)
@@ -90,6 +90,7 @@ Menu entries:
 - `SPPR`: speed pulses per wheel rev (`speed_pulses_per_rev`)
 - `RBAR`: RPM bar max (`rpm_bar_max`)
 - `DBG`: debug overlay on/off
+- `DEMO`: synthetic RPM/speed/temp/trip/odo updates (for bench testing without sensors)
 - `RSET`: restore defaults and save (press `OK` to arm, `OK` again to confirm)
 - `TRIP`: read-only trip distance
 - `TCLR`: clear trip and save (press `OK` to arm, `OK` again to confirm)
@@ -109,6 +110,7 @@ All changeable values are in the **USER SETTINGS** block at the top of `main.py`
 
 Main groups:
 - Hardware pins/buses
+- Display driver select (`OLED_DRIVER = "SSD1306"` or `"SSD1309"`)
 - RPM tuning (`RPM_PULSES_PER_REV`, `RPM_DEBOUNCE_US`, `RPM_TIMEOUT_US`, `RPM_PERIOD_RING_SIZE`, `RPM_BAR_MAX`)
 - Speed tuning (`WHEEL_SIZE_MM`, `SPEED_PULSES_PER_REV`, `SPEED_MULTIPLIER`)
 - Button config (`BTN_*`)

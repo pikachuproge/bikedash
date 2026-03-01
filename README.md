@@ -12,7 +12,7 @@ Minimal MicroPython dashboard for a motorized bike using Raspberry Pi Pico (RP20
 	- Top RPM bar (with tick marks + labels)
 	- Center big speed digits + `km/h`
 	- RPM number with `RPM` label
-	- Bottom-left odometer (`x.x KM`, then whole km at higher values)
+	- Bottom-left odometer (whole km value)
 	- Bottom-right temperature (`xxC` / `TC ERR`)
 	- On-device settings menu + long-press info screen
 	- Persistent settings/trip/odometer/runtime
@@ -20,7 +20,7 @@ Minimal MicroPython dashboard for a motorized bike using Raspberry Pi Pico (RP20
 ## Hardware
 
 - Raspberry Pi Pico (RP2040)
-- SSD1306 128x64 OLED (I2C)
+- SSD1306/SSD1309 128x64 OLED (I2C)
 - Inductive RPM pickup interface (NPN + diode + resistor)
 - Speed pulse sensor (GPIO interrupt)
 - MAX6675 thermocouple module (SPI)
@@ -56,6 +56,7 @@ Current menu items:
 - `SPPR` (speed pulses per wheel rev)
 - `RBAR` (RPM bar max)
 - `DBG` (debug overlay on/off)
+- `DEMO` (synthetic sensor/demo data on/off)
 - `RSET` (restore defaults, 2-step OK confirm)
 - `TRIP` (read-only trip distance)
 - `TCLR` (clear trip, 2-step OK confirm)
@@ -101,6 +102,7 @@ Quick starting values for `WHL` / `WHEEL_SIZE_MM`:
 ## Notes
 
 - All tunable constants are grouped in the **USER SETTINGS** block at the top of `main.py`.
+- Set `OLED_DRIVER` in `main.py` to `"SSD1306"` or `"SSD1309"`.
 - Runtime persistence is stored in `dashboard_settings.json` on the Pico filesystem.
 - Designed to stay simple and finishable while keeping field-tuning practical.
 - See `DASHBOARD.md` for full details.

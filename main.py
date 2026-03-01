@@ -17,6 +17,7 @@ I2C_SDA = const(0)
 I2C_SCL = const(1)
 I2C_FREQ = const(400000)
 OLED_ADDR = const(0x3C)
+OLED_DRIVER = "SSD1306"  # "SSD1306" or "SSD1309"
 
 SPI_ID = const(0)
 SPI_SCK = const(18)
@@ -58,6 +59,7 @@ TEMP_READ_INTERVAL_MS = const(250)
 SAVE_WHEN_RPM_BELOW = const(1800)
 SENSOR_STATUS_TIMEOUT_MS = const(3000)
 DEBUG_OVERLAY_DEFAULT = const(0)
+DEMO_MODE_DEFAULT = const(1)
 
 # UI layout
 RPM_BAR_X = const(4)
@@ -82,21 +84,22 @@ SPEED_TEXT_Y = const(36)
 
 KMH_TEXT = "km/h"
 KMH_GAP_X = const(4)
-KMH_Y_OFFSET = const(8)
+KMH_Y_OFFSET = const(10)
 TEMP_FAULT_TEXT = "TC ERR"
 TEMP_TEXT_X = const(104)
 TEMP_TEXT_Y = const(56)
 
 
 # -----------------------------
-# SSD1306 (I2C)
+# SSD1306/SSD1309 (I2C)
 # -----------------------------
 class SSD1306(framebuf.FrameBuffer):
-    def __init__(self, width, height, i2c, addr=0x3C):
+    def __init__(self, width, height, i2c, addr=0x3C, driver="SSD1306"):
         self.width = width
         self.height = height
         self.i2c = i2c
         self.addr = addr
+        self.driver = driver
         self.pages = height // 8
         self.buffer = bytearray(self.pages * width)
         super().__init__(self.buffer, width, height, framebuf.MONO_VLSB)
@@ -106,23 +109,45 @@ class SSD1306(framebuf.FrameBuffer):
         self.i2c.writeto(self.addr, bytes((0x00, cmd)))
 
     def _init_display(self):
-        for cmd in (
-            0xAE,
-            0x20, 0x00,
-            0x40,
-            0xA1,
-            0xC8,
-            0x81, 0xCF,
-            0xA6,
-            0xA8, 0x3F,
-            0xD3, 0x00,
-            0xD5, 0x80,
-            0xD9, 0xF1,
-            0xDA, 0x12,
-            0xDB, 0x40,
-            0x8D, 0x14,
-            0xAF,
-        ):
+        driver = self.driver.upper()
+
+        if driver == "SSD1309":
+            cmds = (
+                0xAE,
+                0x20, 0x00,
+                0x40,
+                0xA1,
+                0xC8,
+                0x81, 0xCF,
+                0xA6,
+                0xA8, 0x3F,
+                0xD3, 0x00,
+                0xD5, 0x80,
+                0xD9, 0x22,
+                0xDA, 0x12,
+                0xDB, 0x34,
+                0xAF,
+            )
+        else:
+            cmds = (
+                0xAE,
+                0x20, 0x00,
+                0x40,
+                0xA1,
+                0xC8,
+                0x81, 0xCF,
+                0xA6,
+                0xA8, 0x3F,
+                0xD3, 0x00,
+                0xD5, 0x80,
+                0xD9, 0xF1,
+                0xDA, 0x12,
+                0xDB, 0x40,
+                0x8D, 0x14,
+                0xAF,
+            )
+
+        for cmd in cmds:
             self._write_cmd(cmd)
         self.fill(0)
         self.show()
@@ -215,7 +240,10 @@ runtime_accum_ms = 0
 runtime_last_ms = utime.ticks_ms()
 persistent_last_save_ms = utime.ticks_ms()
 debug_overlay_enabled = DEBUG_OVERLAY_DEFAULT
+demo_mode_enabled = DEMO_MODE_DEFAULT
 debug_loop_ms = 0
+demo_last_ms = utime.ticks_ms()
+demo_phase = 0
 
 
 def clamp(value, low, high):
@@ -229,7 +257,7 @@ def clamp(value, low, high):
 def load_settings():
     global rpm_debounce_us, rpm_pulses_per_rev
     global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, speed_multiplier
-    global trip_mm, odo_mm, engine_runtime_s, debug_overlay_enabled
+    global trip_mm, odo_mm, engine_runtime_s, debug_overlay_enabled, demo_mode_enabled
     try:
         with open(SETTINGS_FILE, "r") as f:
             data = ujson.load(f)
@@ -244,6 +272,7 @@ def load_settings():
         odo_mm = clamp(int(data.get("odo_mm", odo_mm)), 0, 999999999)
         engine_runtime_s = clamp(int(data.get("engine_runtime_s", engine_runtime_s)), 0, 999999999)
         debug_overlay_enabled = clamp(int(data.get("debug_overlay_enabled", debug_overlay_enabled)), 0, 1)
+        demo_mode_enabled = clamp(int(data.get("demo_mode_enabled", demo_mode_enabled)), 0, 1)
     except Exception:
         pass
 
@@ -260,6 +289,7 @@ def save_settings():
         "odo_mm": odo_mm,
         "engine_runtime_s": engine_runtime_s,
         "debug_overlay_enabled": debug_overlay_enabled,
+        "demo_mode_enabled": demo_mode_enabled,
     }
     try:
         with open(SETTINGS_FILE, "w") as f:
@@ -273,6 +303,9 @@ def save_settings():
 # Interrupt handlers
 # -----------------------------
 def rpm_interrupt(pin):
+    if demo_mode_enabled:
+        return
+
     global rpm_last_pulse_us, rpm_period_us, rpm_period_head, rpm_period_count
     now = utime.ticks_us()
     if not rpm_last_pulse_us:
@@ -292,6 +325,9 @@ def rpm_interrupt(pin):
 
 
 def spd_interrupt(pin):
+    if demo_mode_enabled:
+        return
+
     global spd_ticks, speed_last_pulse_ms
     spd_ticks += 1
     speed_last_pulse_ms = utime.ticks_ms()
@@ -306,6 +342,9 @@ def display_tick(timer):
 # Calculations
 # -----------------------------
 def update_rpm(timer):
+    if demo_mode_enabled:
+        return
+
     global rpm_value, rpm_last_pulse_us, rpm_period_us, rpm_period_count
 
     irq_state = disable_irq()
@@ -339,6 +378,9 @@ def update_rpm(timer):
 
 
 def get_rpm():
+    if demo_mode_enabled:
+        return rpm_value
+
     if not rpm_last_pulse_us:
         return 0
     if utime.ticks_diff(utime.ticks_us(), rpm_last_pulse_us) >= RPM_TIMEOUT_US:
@@ -347,6 +389,9 @@ def get_rpm():
 
 
 def update_speed():
+    if demo_mode_enabled:
+        return
+
     global spd_ticks, spd_value, speed_last_update_ms
     global trip_mm, trip_dirty, odo_mm, odo_dirty
     irq_state = disable_irq()
@@ -406,12 +451,7 @@ def format_trip_text(mm_value):
 def format_odo_text(mm_value):
     if mm_value < 0:
         mm_value = 0
-    km = mm_value // 1000000
-    if km >= 100:
-        return str(km) + " KM"
-
-    km10 = mm_value // 100000
-    return str(km10 // 10) + "." + str(km10 % 10) + " KM"
+    return str(mm_value // 1000000)
 
 
 def format_runtime_text(seconds):
@@ -432,6 +472,45 @@ def get_sensor_status_text():
     temp_ok = temp is not None
 
     return "R" + ("+" if rpm_ok else "-") + " S" + ("+" if speed_ok else "-") + " T" + ("+" if temp_ok else "-")
+
+
+def update_demo_values():
+    global demo_last_ms, demo_phase
+    global rpm_value, spd_value, temp
+    global rpm_last_pulse_us, speed_last_pulse_ms
+    global trip_mm, odo_mm, trip_dirty, odo_dirty
+
+    now_ms = utime.ticks_ms()
+    dt_ms = utime.ticks_diff(now_ms, demo_last_ms)
+    if dt_ms <= 0:
+        return
+    demo_last_ms = now_ms
+
+    demo_phase = (demo_phase + (dt_ms * 3)) % 2000
+
+    if demo_phase < 1000:
+        rpm_value = 1200 + (demo_phase * 9)
+    else:
+        rpm_value = 1200 + ((1999 - demo_phase) * 9)
+
+    spd_value = rpm_value // 120
+    temp = 70 + ((demo_phase // 50) % 16)
+
+    rpm_last_pulse_us = utime.ticks_us()
+    speed_last_pulse_ms = now_ms
+
+    dist_mm = (spd_value * dt_ms * 1000) // 3600
+    if dist_mm > 0:
+        trip_mm += dist_mm
+        odo_mm += dist_mm
+
+        if trip_mm > 99999999:
+            trip_mm = 99999999
+        if odo_mm > 999999999:
+            odo_mm = 999999999
+
+        trip_dirty = True
+        odo_dirty = True
 
 
 def update_runtime():
@@ -517,12 +596,13 @@ def get_button_event():
 
 
 def settings_count():
-    return 9
+    return 10
 
 
 def reset_settings_to_defaults():
     global rpm_debounce_us, rpm_pulses_per_rev
-    global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, speed_multiplier, debug_overlay_enabled
+    global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, speed_multiplier
+    global debug_overlay_enabled, demo_mode_enabled
 
     rpm_debounce_us = RPM_DEBOUNCE_US
     rpm_pulses_per_rev = RPM_PULSES_PER_REV
@@ -531,6 +611,7 @@ def reset_settings_to_defaults():
     rpm_bar_max = RPM_BAR_MAX
     speed_multiplier = SPEED_MULTIPLIER
     debug_overlay_enabled = DEBUG_OVERLAY_DEFAULT
+    demo_mode_enabled = DEMO_MODE_DEFAULT
 
 
 def clear_trip():
@@ -542,9 +623,17 @@ def clear_trip():
 def adjust_setting(index, delta):
     global settings_dirty
     global rpm_debounce_us, rpm_pulses_per_rev
-    global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, debug_overlay_enabled
+    global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, debug_overlay_enabled, demo_mode_enabled
 
-    before = (rpm_debounce_us, rpm_pulses_per_rev, wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, debug_overlay_enabled)
+    before = (
+        rpm_debounce_us,
+        rpm_pulses_per_rev,
+        wheel_size_mm,
+        speed_pulses_per_rev,
+        rpm_bar_max,
+        debug_overlay_enabled,
+        demo_mode_enabled,
+    )
 
     if index == 0:
         rpm_debounce_us += delta * 100
@@ -579,8 +668,19 @@ def adjust_setting(index, delta):
     elif index == 5:
         if delta != 0:
             debug_overlay_enabled = 0 if debug_overlay_enabled else 1
+    elif index == 6:
+        if delta != 0:
+            demo_mode_enabled = 0 if demo_mode_enabled else 1
 
-    after = (rpm_debounce_us, rpm_pulses_per_rev, wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, debug_overlay_enabled)
+    after = (
+        rpm_debounce_us,
+        rpm_pulses_per_rev,
+        wheel_size_mm,
+        speed_pulses_per_rev,
+        rpm_bar_max,
+        debug_overlay_enabled,
+        demo_mode_enabled,
+    )
     if after != before:
         settings_dirty = True
 
@@ -607,7 +707,7 @@ def handle_buttons():
             info_active = False
         return
 
-    if event == "OK" and menu_index == 6:
+    if event == "OK" and menu_index == 7:
         if not reset_confirm_armed:
             reset_confirm_armed = True
         else:
@@ -620,7 +720,7 @@ def handle_buttons():
             reset_confirm_armed = False
         return
 
-    if event == "OK" and menu_index == 8:
+    if event == "OK" and menu_index == 9:
         if not trip_clear_confirm_armed:
             trip_clear_confirm_armed = True
         else:
@@ -651,13 +751,13 @@ def handle_buttons():
         trip_clear_confirm_armed = False
         menu_index = (menu_index + 1) % settings_count()
     elif event == "LEFT":
-        if menu_index < 6:
+        if menu_index < 7:
             adjust_setting(menu_index, -1)
         else:
             reset_confirm_armed = False
             trip_clear_confirm_armed = False
     elif event == "RIGHT":
-        if menu_index < 6:
+        if menu_index < 7:
             adjust_setting(menu_index, 1)
         else:
             reset_confirm_armed = False
@@ -698,11 +798,13 @@ def draw_settings_menu():
         elif idx == 5:
             label = "DBG  " + ("ON" if debug_overlay_enabled else "OFF")
         elif idx == 6:
+            label = "DEMO " + ("ON" if demo_mode_enabled else "OFF")
+        elif idx == 7:
             if reset_confirm_armed:
                 label = "RSET confirm?"
             else:
                 label = "RSET defaults"
-        elif idx == 7:
+        elif idx == 8:
             label = "TRIP " + str(trip_mm // 1000000) + "." + str((trip_mm // 100000) % 10) + "km"
         else:
             if trip_clear_confirm_armed:
@@ -715,12 +817,12 @@ def draw_settings_menu():
 
     now = utime.ticks_ms()
     help_text = MENU_HELP_TEXT
-    if menu_index == 6:
+    if menu_index == 7:
         if reset_confirm_armed:
             help_text = MENU_HELP_RESET_CONFIRM
         else:
             help_text = MENU_HELP_RESET_ARM
-    elif menu_index == 8:
+    elif menu_index == 9:
         if trip_clear_confirm_armed:
             help_text = MENU_HELP_TCLR_CONFIRM
         else:
@@ -869,8 +971,13 @@ def update_display():
         kmh_x = 128 - (len(KMH_TEXT) * 8)
     oled.text(KMH_TEXT, kmh_x, kmh_y, 1)
 
-    # Bottom-left: odometer
-    oled.text(format_odo_text(odo_mm), 0, TEMP_TEXT_Y, 1)
+    # Bottom-left: odometer (hide unit if it gets too close to km/h label)
+    odo_base = format_odo_text(odo_mm)
+    odo_text = odo_base + " KM"
+    odo_text_w = len(odo_text) * 8
+    if odo_text_w >= (kmh_x - 8):
+        odo_text = odo_base
+    oled.text(odo_text, 0, TEMP_TEXT_Y, 1)
 
     # Bottom-right: live temp (fault-safe)
     temp_text = format_temp_text(temp)
@@ -896,7 +1003,7 @@ def init_hardware():
     global i2c, oled, spi, thermocouple
 
     i2c = I2C(I2C_ID, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=I2C_FREQ)
-    oled = SSD1306(128, 64, i2c, OLED_ADDR)
+    oled = SSD1306(128, 64, i2c, OLED_ADDR, OLED_DRIVER)
 
     spi = SPI(
         SPI_ID,
@@ -963,15 +1070,20 @@ def run_dashboard_loop():
         handle_buttons()
         update_runtime()
 
+        if demo_mode_enabled:
+            update_demo_values()
+
         if display_due:
             display_due = False
 
             if (not info_active) and (not menu_active):
-                update_speed()
+                if not demo_mode_enabled:
+                    update_speed()
 
             update_display()
 
-        update_sensors()
+        if not demo_mode_enabled:
+            update_sensors()
         maybe_save_persistent_state()
         debug_loop_ms = utime.ticks_diff(utime.ticks_us(), loop_start_us) // 1000
         utime.sleep_ms(MAIN_LOOP_SLEEP_MS)
