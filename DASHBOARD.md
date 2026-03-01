@@ -1,281 +1,175 @@
-# Motorcycle Dashboard - Raspberry Pi Pico
+# Motorcycle Dashboard (RP2040 + SSD1306)
 
-A minimal MicroPython motorcycle telemetry dashboard for the Raspberry Pi Pico (RP2040) with an SSD1306 OLED display.
+Current project documentation for the active `main.py` implementation.
 
-## Overview
+## Scope
 
-**Version:** 0.1 (Phase 1)
-
-Displays three real-time values on a 128x64 OLED screen:
-- **RPM** - Engine revolutions per minute
-- **SPD** - Vehicle speed in km/h
-- **TMP** - Engine temperature in °C
-
-Display format:
-```
-RPM: 0000
-SPD: 00
-TMP: 000C
-```
-
-## Hardware Requirements
-
-### Microcontroller
+- Single-file MicroPython dashboard (`main.py`)
 - Raspberry Pi Pico (RP2040)
+- SSD1306 128x64 OLED over I2C
+- RPM input via GPIO interrupt (inductive pickup front-end)
+- Speed input via GPIO interrupt
+- MAX6675 over SPI (temperature currently shown as placeholder `0C`)
+- 5-button runtime settings menu (saved to onboard filesystem)
 
-### Display
-- SSD1306 128x64 OLED (0.96" diagonal)
-- Connection: I2C interface
-- Default I2C address: `0x3C`
+## Current UI
 
-### Sensors
-- **RPM Sensor** - GPIO interrupt (rising edge pulses)
-- **Speed Sensor** - GPIO interrupt (rising edge pulses)
-- **Temperature Sensor** - MAX6675 K-type thermocouple reader
-- Connection: SPI interface
+- **Top:** RPM horizontal bar with fill, tick marks, and numeric tick labels
+- **Top/Mid:** RPM number + `RPM` label
+- **Center/Bottom:** Large speed digits with `km/h` text to the right
+- **Bottom-right:** temperature placeholder `0C`
 
-## Pinout
+## Default Pinout
 
-| Component | Pin | GPIO |
-|-----------|-----|------|
-| OLED SDA | SDA | GP0 |
-| OLED SCL | SCL | GP1 |
-| MAX6675 SCK | CLK | GP18 |
-| MAX6675 MOSI | DIN | GP19 |
-| MAX6675 MISO | DO | GP16 |
-| MAX6675 CS | CS | GP17 |
-| RPM Sensor | - | GP2 |
-| Speed Sensor | - | GP3 |
+| Signal | GPIO |
+|---|---|
+| OLED SDA | GP0 |
+| OLED SCL | GP1 |
+| MAX6675 SCK | GP18 |
+| MAX6675 MOSI | GP19 |
+| MAX6675 MISO | GP16 |
+| MAX6675 CS | GP17 |
+| RPM input | GP2 |
+| Speed input | GP3 |
 
-**Note:** Adjust these pins in the code if using different GPIO assignments.
+## Button Pinout
 
-## Code Structure
+| Button | GPIO |
+|---|---|
+| UP | GP6 |
+| DOWN | GP7 |
+| LEFT | GP8 |
+| RIGHT | GP9 |
+| OK | GP10 |
 
-### Classes
+Button wiring is active-low with internal pull-up:
+- One side of each button to GPIO
+- Other side to GND
 
-#### `SSD1306`
-Minimal SSD1306 OLED driver for text rendering.
+## RPM Logic (Current)
 
-**Methods:**
-- `__init__(i2c, addr)` - Initialize display
-- `clear()` - Clear framebuffer
-- `text(s, x, y, color)` - Render text at position (x, y)
-- `show()` - Update display with framebuffer contents
-- `_char(c, x, y, color)` - Internal character rendering
-- `_init_display()` - Send initialization sequence to display
+- IRQ on rising edge collects pulse periods
+- Debounce with `RPM_DEBOUNCE_US`
+- Periods stored in ring buffer (`RPM_PERIOD_RING_SIZE`)
+- `update_rpm()` uses median period for robust RPM estimate
+- Stall timeout handled by `RPM_TIMEOUT_US`
 
-**Features:**
-- 5x7 font built-in
-- Supports characters 32-126 (space through tilde)
-- Framebuffer-based rendering
+## Speed Logic (Current)
 
-#### `MAX6675`
-K-type thermocouple temperature reader over SPI.
+- Speed pulses are counted by interrupt
+- Speed is computed from:
+	- `WHEEL_SIZE_MM`
+	- `SPEED_PULSES_PER_REV`
+	- elapsed update time
+- Fallback multiplier exists (`SPEED_MULTIPLIER`) if wheel/pulse settings are invalid
 
-**Methods:**
-- `__init__(spi, cs_pin)` - Initialize SPI and chip select
-- `read_temp()` - Read temperature in °C
+## Settings Menu
 
-**Conversion:**
-- Raw 16-bit value read over SPI
-- Upper 13 bits contain temperature data
-- Each LSB = 0.25°C
+Controls:
+- `OK`: open/close menu
+- `UP` / `DOWN`: select item
+- `LEFT` / `RIGHT`: adjust selected value
 
-### Global Variables
+Menu entries:
+- `DBNC`: RPM debounce (`rpm_debounce_us`)
+- `RPPR`: RPM pulses per rev (`rpm_pulses_per_rev`)
+- `WHL`: wheel size in mm (`wheel_size_mm`)
+- `SPPR`: speed pulses per wheel rev (`speed_pulses_per_rev`)
+- `RBAR`: RPM bar max (`rpm_bar_max`)
+- `RSET`: restore defaults and save (press `OK` to arm, `OK` again to confirm)
 
-| Variable | Type | Purpose |
-|----------|------|---------|
-| `rpm_ticks` | int | Pulse count for RPM calculation |
-| `rpm_last_time` | int | Millisecond timestamp of last RPM update |
-| `rpm_value` | int | Calculated RPM (display value) |
-| `spd_ticks` | int | Pulse count for speed calculation |
-| `spd_value` | int | Calculated speed (display value) |
-| `temp` | float | Current temperature reading |
+Menu footer uses a single scrolling help line for button hints.
 
-### Interrupt Handlers
+## Timers / Loop
 
-#### `rpm_interrupt(pin)`
-Called on rising edge of RPM sensor signal. Increments pulse counter.
+- `rpm_timer`: updates RPM estimator at `RPM_UPDATE_HZ`
+- `display_timer`: sets display-due flag at `DISPLAY_UPDATE_HZ`
+- Main loop renders display and reads MAX6675
 
-#### `spd_interrupt(pin)`
-Called on rising edge of speed sensor signal. Increments pulse counter.
+## Tuning Guide (One Place)
 
-### Callback Functions
+All changeable values are in the **USER SETTINGS** block at the top of `main.py`.
 
-#### `update_rpm(timer)`
-**Frequency:** 2 Hz (every 500ms)
+Main groups:
+- Hardware pins/buses
+- RPM tuning (`RPM_PULSES_PER_REV`, `RPM_DEBOUNCE_US`, `RPM_TIMEOUT_US`, `RPM_PERIOD_RING_SIZE`, `RPM_BAR_MAX`)
+- Speed tuning (`WHEEL_SIZE_MM`, `SPEED_PULSES_PER_REV`, `SPEED_MULTIPLIER`)
+- Button config (`BTN_*`)
+- Timing (`RPM_UPDATE_HZ`, `DISPLAY_UPDATE_HZ`, `MAIN_LOOP_SLEEP_MS`)
+- UI layout (bar position, tick count/labels, RPM text offsets, speed digit geometry, `km/h` position)
 
-Calculates RPM from pulse count and elapsed time:
-```
-RPM = (pulse_count * 60000) / elapsed_ms
-```
+## Run
 
-Resets counters after calculation.
+1. Flash MicroPython to Pico
+2. Copy `main.py` to board
+3. Reset board
 
-#### `update_display(timer)`
-**Frequency:** 10 Hz (every 100ms)
+Example with `mpremote`:
 
-- Updates speed value: `speed = pulse_count * 10` (adjustable multiplier)
-- Clears OLED framebuffer
-- Renders three lines of text
-- Updates display
-
-## How It Works
-
-1. **Hardware Initialization**
-   - I2C bus (400 kHz) for OLED
-   - SPI (4 MHz) for MAX6675
-   - GPIO interrupts on RPM and speed pins (rising edge)
-   - Two timers: one for RPM calculation, one for display update
-
-2. **Main Loop**
-   - Continuously reads thermocouple temperature (~0.1s interval)
-   - Updates global `temp` variable
-
-3. **Real-Time Updates**
-   - RPM sensor pulses → `rpm_ticks` incremented
-   - Speed sensor pulses → `spd_ticks` incremented
-   - Every 500ms: RPM calculated from pulse count and elapsed time
-   - Every 100ms: Display updated with latest values
-   - Every ~100ms: Temperature read and updated
-
-4. **Display Refresh**
-   - 10 FPS update rate keeps display responsive
-   - Minimal flickering due to framebuffer architecture
-
-## Setup & Installation
-
-### 1. Flash MicroPython
-Download and flash latest MicroPython for Raspberry Pi Pico:
 ```bash
-# Using thonny or mpremote
 mpremote cp main.py :main.py
+mpremote reset
 ```
 
-### 2. Upload Code
-Save `blink.py` as `main.py` on the Pico.
+## Notes
 
-### 3. Hardware Connections
-Connect sensors and display according to the pinout table above.
+- Keep edits minimal and test on real hardware after each change.
+- If RPM gets noisy, tune `RPM_DEBOUNCE_US` first.
+- If scale needs adjustment, change `RPM_PULSES_PER_REV` and `RPM_BAR_MAX`.
 
-### 4. Run
-The dashboard starts automatically on power-up. Press Ctrl+C in REPL to stop.
+## Quick Tune Cheatsheet
 
-## Customization
+Use these as practical defaults for a 2-stroke single-cylinder pickup:
 
-### Adjust Speed Multiplier
-In `update_display()` function:
-```python
-spd_value = spd_ticks * 10  # Change 10 to your sensor ratio
-```
+- `RPM_PULSES_PER_REV = 1`
+- `RPM_DEBOUNCE_US = 4000`
+- `RPM_PERIOD_RING_SIZE = 7`
+- `RPM_TIMEOUT_US = 2000000`
+- `RPM_BAR_MAX = 10000`
+- `WHEEL_SIZE_MM = 2100`
+- `SPEED_PULSES_PER_REV = 1`
 
-**Calculation:**
-- If your speed sensor gives 1 pulse per km traveled, use multiplier 10 (for 10 Hz refresh, that's 0.1 km per pulse)
-- Adjust based on wheel circumference and pulses per rotation
+### Wheel Size Presets (starting points)
 
-### Adjust I2C Address
-If your OLED is at a different address:
-```python
-OLED_ADDR = 0x3D  # or 0x3C (default)
-```
+Set `WHEEL_SIZE_MM` to one of these common values, then fine-tune with GPS:
 
-### Adjust GPIO Pins
-Modify constants at top of file:
-```python
-I2C_SDA = 0
-I2C_SCL = 1
-RPM_PIN = 2
-SPD_PIN = 3
-# etc.
-```
+| Wheel/Tire | `WHEEL_SIZE_MM` |
+|---|---:|
+| 20 x 1.75 | 1590 |
+| 24 x 1.95 | 1915 |
+| 26 x 1.95 | 2055 |
+| 26 x 2.125 | 2070 |
+| 26 x 2.2 | 2090 |
+| 27.5 x 2.1 | 2185 |
+| 700x35C | 2168 |
+| 700x38C | 2180 |
+| 700x40C | 2200 |
+| 29 x 2.1 | 2285 |
 
-### Adjust Display Update Rate
-RPM calculation frequency (currently 2 Hz):
-```python
-rpm_timer.init(freq=2, callback=update_rpm)  # 2 Hz = 500ms window
-```
+Quick calibration:
+1. Pick nearest preset.
+2. Ride at steady speed and compare to GPS.
+3. Increase `WHEEL_SIZE_MM` if dashboard speed is low; decrease it if speed is high.
 
-Display refresh rate (currently 10 Hz):
-```python
-display_timer.init(freq=10, callback=update_display)  # 10 Hz
-```
+If behavior is not ideal:
 
-### Adjust SPI Speed
-For MAX6675:
-```python
-spi = SPI(SPI_ID, baudrate=4000000, ...)  # 4 MHz (safe default)
-```
+- **RPM spikes high** → increase `RPM_DEBOUNCE_US` by `+300` to `+700`
+- **RPM reads too low / misses pulses** → decrease `RPM_DEBOUNCE_US` by `-300` to `-700`
+- **Display too jumpy** → increase `RPM_PERIOD_RING_SIZE` (`7` → `9`)
+- **Display too sluggish** → decrease `RPM_PERIOD_RING_SIZE` (`7` → `5`)
+- **RPM drops to zero too quickly** → increase `RPM_TIMEOUT_US`
+- **RPM hangs above zero too long after stop** → decrease `RPM_TIMEOUT_US`
+- **Speed reads high/low at all ranges** → tune `WHEEL_SIZE_MM`
+- **Speed jumps in steps** → verify/tune `SPEED_PULSES_PER_REV`
 
-## Constraints & Limitations
+Safe tuning workflow:
 
-- **Single file:** All code in one `main.py` file (no modules)
-- **Memory:** Minimal allocation for Pico (264 KB RAM total)
-- **Font:** 5x7 ASCII only (characters 32-126)
-- **RPM timing:** Resolution depends on pulse frequency (lower RPM = less accurate)
-- **Temperature:** Reads continuously in main loop (not interrupt-driven)
-- **Display:** 128x64 pixels only
-- **No persistence:** Values reset on power cycle
-
-## Troubleshooting
-
-### Display Not Showing
-- Check I2C address (default 0x3C)
-- Verify SDA/SCL pins and pull-ups
-- Check I2C communication: `i2c.scan()` in REPL
-
-### RPM Always Zero
-- Check RPM sensor connection to GP2
-- Verify sensor produces rising-edge pulses
-- Monitor with oscilloscope or logic analyzer
-
-### Speed Not Updating
-- Check speed sensor on GP3
-- Verify multiplier value in code
-- Check pulse count in REPL (add debug print)
-
-### Temperature Always Zero
-- Check MAX6675 SPI connections (SCK, MOSI, MISO, CS)
-- Verify thermocouple leads connected correctly
-- Check SPI communication errors
-
-### Memory Issues
-- Monitor free RAM: `import gc; print(gc.mem_free())`
-- Reduce display refresh rate if needed
-- Clear unused buffers
-
-## Performance Notes
-
-- **CPU Usage:** Minimal (interrupt-driven, timer-based)
-- **Refresh Rate:** 10 FPS sufficient for dashboard
-- **Latency:** <100ms typical response to sensor input
-- **Power Draw:** ~150 mA typical (Pico + OLED + sensors)
-
-## Future Enhancements (Phase 2+)
-
-- Configurable units (RPM, speed, temperature)
-- Settings menu
-- Data logging
-- Low RPM cutoff
-- Max values tracking
-- Gear detection
-- Multiple display modes
-- Peak hold indicators
-
-## License
-
-MIT License - Free to modify and distribute.
-
-## Support
-
-For issues or questions:
-1. Check pinout configuration
-2. Verify all connections
-3. Test with simple debug scripts
-4. Use REPL for live debugging
+1. Change only one setting at a time.
+2. Test at idle, mid, and high RPM.
+3. Keep the change only if it improves all three ranges.
 
 ---
 
-**Version:** 0.1 (Stable)  
-**Last Updated:** March 1, 2026  
+**Updated:** March 1, 2026  
 **Target:** Raspberry Pi Pico (RP2040)  
 **Language:** MicroPython
