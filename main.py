@@ -1,8 +1,11 @@
 from machine import Pin, I2C, SPI, Timer, disable_irq, enable_irq
 from micropython import const
+import micropython
 import framebuf
 import utime
 import ujson
+
+micropython.alloc_emergency_exception_buf(100)
 
 # -----------------------------
 # USER SETTINGS (edit here)
@@ -50,7 +53,10 @@ MENU_SCROLL_STEP_MS = const(50)
 RPM_UPDATE_HZ = const(20)
 DISPLAY_UPDATE_HZ = const(10)
 MAIN_LOOP_SLEEP_MS = const(20)
-TRIP_SAVE_INTERVAL_MS = const(3000)
+TRIP_SAVE_INTERVAL_MS = const(15000)
+TEMP_READ_INTERVAL_MS = const(250)
+SAVE_WHEN_RPM_BELOW = const(1800)
+SENSOR_STATUS_TIMEOUT_MS = const(3000)
 
 # UI layout
 RPM_BAR_X = const(4)
@@ -165,8 +171,10 @@ rpm_period_count = 0
 
 spd_ticks = 0
 spd_value = 0
+speed_last_pulse_ms = utime.ticks_ms()
 
 temp = None
+temp_last_read_ms = utime.ticks_ms()
 display_due = False
 
 # Runtime-tunable values (editable from menu)
@@ -279,8 +287,9 @@ def rpm_interrupt(pin):
 
 
 def spd_interrupt(pin):
-    global spd_ticks
+    global spd_ticks, speed_last_pulse_ms
     spd_ticks += 1
+    speed_last_pulse_ms = utime.ticks_ms()
 
 
 def display_tick(timer):
@@ -405,6 +414,17 @@ def format_runtime_text(seconds):
     return "RUN " + str(hours) + ":" + "{:02d}".format(mins) + ":" + "{:02d}".format(secs)
 
 
+def get_sensor_status_text():
+    now_us = utime.ticks_us()
+    now_ms = utime.ticks_ms()
+
+    rpm_ok = rpm_last_pulse_us and utime.ticks_diff(now_us, rpm_last_pulse_us) < RPM_TIMEOUT_US
+    speed_ok = utime.ticks_diff(now_ms, speed_last_pulse_ms) < SENSOR_STATUS_TIMEOUT_MS
+    temp_ok = temp is not None
+
+    return "R" + ("+" if rpm_ok else "-") + " S" + ("+" if speed_ok else "-") + " T" + ("+" if temp_ok else "-")
+
+
 def update_runtime():
     global runtime_last_ms, runtime_accum_ms, engine_runtime_s, runtime_dirty
     now = utime.ticks_ms()
@@ -426,6 +446,9 @@ def update_runtime():
 def maybe_save_persistent_state():
     global trip_dirty, odo_dirty, runtime_dirty, persistent_last_save_ms
     if not (trip_dirty or odo_dirty or runtime_dirty):
+        return
+
+    if get_rpm() > SAVE_WHEN_RPM_BELOW:
         return
 
     now = utime.ticks_ms()
@@ -699,7 +722,7 @@ def draw_settings_menu():
 
 def draw_info_screen():
     oled.fill(0)
-    oled.text("INFO", 48, 0, 1)
+    oled.text("INFO " + get_sensor_status_text(), 0, 0, 1)
     oled.text("ODO " + format_odo_text(odo_mm), 0, 14, 1)
     oled.text(format_trip_text(trip_mm) + " KM", 0, 26, 1)
     oled.text(format_runtime_text(engine_runtime_s), 0, 38, 1)
@@ -879,7 +902,10 @@ def init_buttons_and_inputs():
     load_settings()
 
     rpm_pin = Pin(RPM_PIN, Pin.IN, Pin.PULL_DOWN)
-    rpm_pin.irq(trigger=Pin.IRQ_RISING, handler=rpm_interrupt)
+    try:
+        rpm_pin.irq(trigger=Pin.IRQ_RISING, handler=rpm_interrupt, hard=True)
+    except TypeError:
+        rpm_pin.irq(trigger=Pin.IRQ_RISING, handler=rpm_interrupt)
 
     spd_pin = Pin(SPD_PIN, Pin.IN, Pin.PULL_DOWN)
     spd_pin.irq(trigger=Pin.IRQ_RISING, handler=spd_interrupt)
@@ -896,7 +922,12 @@ def init_timers():
 
 
 def update_sensors():
-    global temp
+    global temp, temp_last_read_ms
+    now = utime.ticks_ms()
+    if utime.ticks_diff(now, temp_last_read_ms) < TEMP_READ_INTERVAL_MS:
+        return
+
+    temp_last_read_ms = now
     try:
         temp = thermocouple.read_temp()
     except Exception:

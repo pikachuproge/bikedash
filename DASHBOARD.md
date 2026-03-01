@@ -29,6 +29,7 @@ Current project documentation for the active `main.py` implementation.
 	- Trip distance
 	- Engine runtime
 	- Current temperature / fault text
+	- Sensor status flags (`R/S/T`, `+`=recent signal, `-`=stale/fault)
 
 ## Default Pinout
 
@@ -131,6 +132,14 @@ mpremote reset
 - Keep edits minimal and test on real hardware after each change.
 - If RPM gets noisy, tune `RPM_DEBOUNCE_US` first.
 - If scale needs adjustment, change `RPM_PULSES_PER_REV` and `RPM_BAR_MAX`.
+
+## Field Validation Checklist
+
+1. Verify short `OK` opens settings and long `OK` opens info screen.
+2. Compare speed to GPS and tune `WHEEL_SIZE_MM` / `SPEED_PULSES_PER_REV`.
+3. Confirm RPM stability at idle, mid, and high range.
+4. Reboot and verify settings, odometer, trip, and runtime persist.
+5. Check fault handling: thermocouple disconnect shows `TC ERR`; info status flags change to `-` when stale.
 
 ## Quick Tune Cheatsheet
 

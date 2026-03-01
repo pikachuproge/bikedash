@@ -66,6 +66,25 @@ Shows:
 - Trip distance
 - Engine runtime
 - Temperature / fault state
+- Sensor status flags (`R/S/T` where `+`=recent signal, `-`=stale/fault)
+
+## Field Validation Checklist (v0.3 beta)
+
+1. Power-on sanity
+	- Display boots cleanly and responds to buttons.
+	- Long-press `OK` opens info screen; short `OK` opens settings.
+2. RPM validation
+	- Check idle RPM stability; tune `DBNC` if noisy.
+	- Verify RPM rises/falls smoothly through mid/high range.
+3. Speed validation
+	- Compare speed against GPS at steady pace.
+	- Tune `WHL` / `SPPR` until error is acceptable.
+4. Persistence validation
+	- Change menu values, exit settings, reboot, confirm values persisted.
+	- Ride briefly, reboot, confirm `ODO`, `TRIP`, and runtime persisted.
+5. Fault behavior validation
+	- Disconnect thermocouple briefly and confirm `TC ERR` + `T-` on info screen.
+	- Stop speed pulses and verify `S-` appears after timeout.
 
 ## Wheel Size Presets
 
