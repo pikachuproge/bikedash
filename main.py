@@ -57,6 +57,7 @@ TRIP_SAVE_INTERVAL_MS = const(15000)
 TEMP_READ_INTERVAL_MS = const(250)
 SAVE_WHEN_RPM_BELOW = const(1800)
 SENSOR_STATUS_TIMEOUT_MS = const(3000)
+DEBUG_OVERLAY_DEFAULT = const(0)
 
 # UI layout
 RPM_BAR_X = const(4)
@@ -213,6 +214,8 @@ runtime_dirty = False
 runtime_accum_ms = 0
 runtime_last_ms = utime.ticks_ms()
 persistent_last_save_ms = utime.ticks_ms()
+debug_overlay_enabled = DEBUG_OVERLAY_DEFAULT
+debug_loop_ms = 0
 
 
 def clamp(value, low, high):
@@ -226,7 +229,7 @@ def clamp(value, low, high):
 def load_settings():
     global rpm_debounce_us, rpm_pulses_per_rev
     global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, speed_multiplier
-    global trip_mm, odo_mm, engine_runtime_s
+    global trip_mm, odo_mm, engine_runtime_s, debug_overlay_enabled
     try:
         with open(SETTINGS_FILE, "r") as f:
             data = ujson.load(f)
@@ -240,6 +243,7 @@ def load_settings():
         trip_mm = clamp(int(data.get("trip_mm", trip_mm)), 0, 99999999)
         odo_mm = clamp(int(data.get("odo_mm", odo_mm)), 0, 999999999)
         engine_runtime_s = clamp(int(data.get("engine_runtime_s", engine_runtime_s)), 0, 999999999)
+        debug_overlay_enabled = clamp(int(data.get("debug_overlay_enabled", debug_overlay_enabled)), 0, 1)
     except Exception:
         pass
 
@@ -255,6 +259,7 @@ def save_settings():
         "trip_mm": trip_mm,
         "odo_mm": odo_mm,
         "engine_runtime_s": engine_runtime_s,
+        "debug_overlay_enabled": debug_overlay_enabled,
     }
     try:
         with open(SETTINGS_FILE, "w") as f:
@@ -358,10 +363,14 @@ def update_speed():
 
     if speed_pulses_per_rev > 0 and wheel_size_mm > 0:
         circ_mm = (wheel_size_mm * 31416) // 10000
-        dist_mm = (ticks * circ_mm) / speed_pulses_per_rev
-        spd_value = int((dist_mm * 3.6) / elapsed_ms)
+        dist_num = ticks * circ_mm
+        denom = speed_pulses_per_rev * elapsed_ms * 10
+        if denom > 0:
+            spd_value = (dist_num * 36) // denom
+        else:
+            spd_value = 0
 
-        dist_int = int(dist_mm + 0.5)
+        dist_int = (dist_num + (speed_pulses_per_rev // 2)) // speed_pulses_per_rev
         if dist_int > 0:
             trip_mm += dist_int
             odo_mm += dist_int
@@ -508,12 +517,12 @@ def get_button_event():
 
 
 def settings_count():
-    return 8
+    return 9
 
 
 def reset_settings_to_defaults():
     global rpm_debounce_us, rpm_pulses_per_rev
-    global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, speed_multiplier
+    global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, speed_multiplier, debug_overlay_enabled
 
     rpm_debounce_us = RPM_DEBOUNCE_US
     rpm_pulses_per_rev = RPM_PULSES_PER_REV
@@ -521,6 +530,7 @@ def reset_settings_to_defaults():
     speed_pulses_per_rev = SPEED_PULSES_PER_REV
     rpm_bar_max = RPM_BAR_MAX
     speed_multiplier = SPEED_MULTIPLIER
+    debug_overlay_enabled = DEBUG_OVERLAY_DEFAULT
 
 
 def clear_trip():
@@ -532,9 +542,9 @@ def clear_trip():
 def adjust_setting(index, delta):
     global settings_dirty
     global rpm_debounce_us, rpm_pulses_per_rev
-    global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max
+    global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, debug_overlay_enabled
 
-    before = (rpm_debounce_us, rpm_pulses_per_rev, wheel_size_mm, speed_pulses_per_rev, rpm_bar_max)
+    before = (rpm_debounce_us, rpm_pulses_per_rev, wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, debug_overlay_enabled)
 
     if index == 0:
         rpm_debounce_us += delta * 100
@@ -566,8 +576,11 @@ def adjust_setting(index, delta):
             rpm_bar_max = 4000
         elif rpm_bar_max > 20000:
             rpm_bar_max = 20000
+    elif index == 5:
+        if delta != 0:
+            debug_overlay_enabled = 0 if debug_overlay_enabled else 1
 
-    after = (rpm_debounce_us, rpm_pulses_per_rev, wheel_size_mm, speed_pulses_per_rev, rpm_bar_max)
+    after = (rpm_debounce_us, rpm_pulses_per_rev, wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, debug_overlay_enabled)
     if after != before:
         settings_dirty = True
 
@@ -594,7 +607,7 @@ def handle_buttons():
             info_active = False
         return
 
-    if event == "OK" and menu_index == 5:
+    if event == "OK" and menu_index == 6:
         if not reset_confirm_armed:
             reset_confirm_armed = True
         else:
@@ -607,7 +620,7 @@ def handle_buttons():
             reset_confirm_armed = False
         return
 
-    if event == "OK" and menu_index == 7:
+    if event == "OK" and menu_index == 8:
         if not trip_clear_confirm_armed:
             trip_clear_confirm_armed = True
         else:
@@ -638,13 +651,13 @@ def handle_buttons():
         trip_clear_confirm_armed = False
         menu_index = (menu_index + 1) % settings_count()
     elif event == "LEFT":
-        if menu_index < 5:
+        if menu_index < 6:
             adjust_setting(menu_index, -1)
         else:
             reset_confirm_armed = False
             trip_clear_confirm_armed = False
     elif event == "RIGHT":
-        if menu_index < 5:
+        if menu_index < 6:
             adjust_setting(menu_index, 1)
         else:
             reset_confirm_armed = False
@@ -683,11 +696,13 @@ def draw_settings_menu():
         elif idx == 4:
             label = "RBAR " + str(rpm_bar_max)
         elif idx == 5:
+            label = "DBG  " + ("ON" if debug_overlay_enabled else "OFF")
+        elif idx == 6:
             if reset_confirm_armed:
                 label = "RSET confirm?"
             else:
                 label = "RSET defaults"
-        elif idx == 6:
+        elif idx == 7:
             label = "TRIP " + str(trip_mm // 1000000) + "." + str((trip_mm // 100000) % 10) + "km"
         else:
             if trip_clear_confirm_armed:
@@ -700,12 +715,12 @@ def draw_settings_menu():
 
     now = utime.ticks_ms()
     help_text = MENU_HELP_TEXT
-    if menu_index == 5:
+    if menu_index == 6:
         if reset_confirm_armed:
             help_text = MENU_HELP_RESET_CONFIRM
         else:
             help_text = MENU_HELP_RESET_ARM
-    elif menu_index == 7:
+    elif menu_index == 8:
         if trip_clear_confirm_armed:
             help_text = MENU_HELP_TCLR_CONFIRM
         else:
@@ -801,7 +816,6 @@ def update_display():
         oled.show()
         return
 
-    update_speed()
     rpm_now = get_rpm()
 
     oled.fill(0)
@@ -864,6 +878,13 @@ def update_display():
     if temp_x < 0:
         temp_x = 0
     oled.text(temp_text, temp_x, TEMP_TEXT_Y, 1)
+
+    if debug_overlay_enabled:
+        dbg_text = "D" + str(debug_loop_ms)
+        dbg_x = 128 - (len(dbg_text) * 8)
+        if dbg_x < 0:
+            dbg_x = 0
+        oled.text(dbg_text, dbg_x, 0, 1)
 
     oled.show()
 
@@ -935,18 +956,24 @@ def update_sensors():
 
 
 def run_dashboard_loop():
-    global display_due
+    global display_due, debug_loop_ms
 
     while True:
+        loop_start_us = utime.ticks_us()
         handle_buttons()
         update_runtime()
 
         if display_due:
             display_due = False
+
+            if (not info_active) and (not menu_active):
+                update_speed()
+
             update_display()
 
         update_sensors()
         maybe_save_persistent_state()
+        debug_loop_ms = utime.ticks_diff(utime.ticks_us(), loop_start_us) // 1000
         utime.sleep_ms(MAIN_LOOP_SLEEP_MS)
 
 

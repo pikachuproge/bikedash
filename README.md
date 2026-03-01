@@ -55,6 +55,7 @@ Current menu items:
 - `WHL` (wheel size, mm)
 - `SPPR` (speed pulses per wheel rev)
 - `RBAR` (RPM bar max)
+- `DBG` (debug overlay on/off)
 - `RSET` (restore defaults, 2-step OK confirm)
 - `TRIP` (read-only trip distance)
 - `TCLR` (clear trip, 2-step OK confirm)

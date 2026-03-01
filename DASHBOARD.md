@@ -89,6 +89,7 @@ Menu entries:
 - `WHL`: wheel size in mm (`wheel_size_mm`)
 - `SPPR`: speed pulses per wheel rev (`speed_pulses_per_rev`)
 - `RBAR`: RPM bar max (`rpm_bar_max`)
+- `DBG`: debug overlay on/off
 - `RSET`: restore defaults and save (press `OK` to arm, `OK` again to confirm)
 - `TRIP`: read-only trip distance
 - `TCLR`: clear trip and save (press `OK` to arm, `OK` again to confirm)
