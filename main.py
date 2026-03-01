@@ -43,12 +43,14 @@ BTN_LEFT_PIN = const(8)
 BTN_RIGHT_PIN = const(9)
 BTN_OK_PIN = const(10)
 BTN_DEBOUNCE_MS = const(140)
+OK_LONG_PRESS_MS = const(800)
 MENU_SCROLL_STEP_MS = const(50)
 
 # Display refresh and loop timing
 RPM_UPDATE_HZ = const(20)
 DISPLAY_UPDATE_HZ = const(10)
 MAIN_LOOP_SLEEP_MS = const(20)
+TRIP_SAVE_INTERVAL_MS = const(3000)
 
 # UI layout
 RPM_BAR_X = const(4)
@@ -74,7 +76,7 @@ SPEED_TEXT_Y = const(36)
 KMH_TEXT = "km/h"
 KMH_GAP_X = const(4)
 KMH_Y_OFFSET = const(8)
-TEMP_TEXT = "0C"
+TEMP_FAULT_TEXT = "TC ERR"
 TEMP_TEXT_X = const(104)
 TEMP_TEXT_Y = const(56)
 
@@ -143,9 +145,12 @@ class MAX6675:
         raw = self.spi.read(2)
         self.cs.on()
 
+        if not raw or len(raw) != 2:
+            return None
+
         value = (raw[0] << 8) | raw[1]
         if value & 0x0004:
-            return 0.0
+            return None
         return ((value >> 3) & 0x0FFF) * 0.25
 
 
@@ -161,7 +166,7 @@ rpm_period_count = 0
 spd_ticks = 0
 spd_value = 0
 
-temp = 0.0
+temp = None
 display_due = False
 
 # Runtime-tunable values (editable from menu)
@@ -175,16 +180,31 @@ speed_last_update_ms = utime.ticks_ms()
 
 # Menu state
 menu_active = False
+info_active = False
 menu_index = 0
 last_btn_ms = 0
+ok_press_start_ms = None
+ok_long_fired = False
 menu_scroll_x = 128
 menu_scroll_last_ms = 0
 MENU_HELP_TEXT = "U/D select  L/R adjust  OK exit"
 MENU_HELP_RESET_ARM = "RSET: OK arm  U/D cancel"
 MENU_HELP_RESET_CONFIRM = "RSET: OK confirm  U/D cancel"
+MENU_HELP_TCLR_ARM = "TCLR: OK arm  U/D cancel"
+MENU_HELP_TCLR_CONFIRM = "TCLR: OK confirm  U/D cancel"
 SETTINGS_FILE = "dashboard_settings.json"
 settings_dirty = False
 reset_confirm_armed = False
+trip_clear_confirm_armed = False
+trip_mm = 0
+odo_mm = 0
+engine_runtime_s = 0
+trip_dirty = False
+odo_dirty = False
+runtime_dirty = False
+runtime_accum_ms = 0
+runtime_last_ms = utime.ticks_ms()
+persistent_last_save_ms = utime.ticks_ms()
 
 
 def clamp(value, low, high):
@@ -198,6 +218,7 @@ def clamp(value, low, high):
 def load_settings():
     global rpm_debounce_us, rpm_pulses_per_rev
     global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, speed_multiplier
+    global trip_mm, odo_mm, engine_runtime_s
     try:
         with open(SETTINGS_FILE, "r") as f:
             data = ujson.load(f)
@@ -208,6 +229,9 @@ def load_settings():
         speed_pulses_per_rev = clamp(int(data.get("speed_pulses_per_rev", speed_pulses_per_rev)), 1, 20)
         rpm_bar_max = clamp(int(data.get("rpm_bar_max", rpm_bar_max)), 4000, 20000)
         speed_multiplier = clamp(int(data.get("speed_multiplier", speed_multiplier)), 1, 50)
+        trip_mm = clamp(int(data.get("trip_mm", trip_mm)), 0, 99999999)
+        odo_mm = clamp(int(data.get("odo_mm", odo_mm)), 0, 999999999)
+        engine_runtime_s = clamp(int(data.get("engine_runtime_s", engine_runtime_s)), 0, 999999999)
     except Exception:
         pass
 
@@ -220,6 +244,9 @@ def save_settings():
         "speed_pulses_per_rev": speed_pulses_per_rev,
         "rpm_bar_max": rpm_bar_max,
         "speed_multiplier": speed_multiplier,
+        "trip_mm": trip_mm,
+        "odo_mm": odo_mm,
+        "engine_runtime_s": engine_runtime_s,
     }
     try:
         with open(SETTINGS_FILE, "w") as f:
@@ -307,6 +334,7 @@ def get_rpm():
 
 def update_speed():
     global spd_ticks, spd_value, speed_last_update_ms
+    global trip_mm, trip_dirty, odo_mm, odo_dirty
     irq_state = disable_irq()
     ticks = spd_ticks
     spd_ticks = 0
@@ -323,8 +351,92 @@ def update_speed():
         circ_mm = (wheel_size_mm * 31416) // 10000
         dist_mm = (ticks * circ_mm) / speed_pulses_per_rev
         spd_value = int((dist_mm * 3.6) / elapsed_ms)
+
+        dist_int = int(dist_mm + 0.5)
+        if dist_int > 0:
+            trip_mm += dist_int
+            odo_mm += dist_int
+            if trip_mm < 0:
+                trip_mm = 0
+            elif trip_mm > 99999999:
+                trip_mm = 99999999
+            if odo_mm < 0:
+                odo_mm = 0
+            elif odo_mm > 999999999:
+                odo_mm = 999999999
+            trip_dirty = True
+            odo_dirty = True
     else:
         spd_value = ticks * speed_multiplier
+
+
+def format_temp_text(temp_value):
+    if temp_value is None:
+        return TEMP_FAULT_TEXT
+    if temp_value < -99 or temp_value > 999:
+        return TEMP_FAULT_TEXT
+    return str(int(temp_value + 0.5)) + "C"
+
+
+def format_trip_text(mm_value):
+    if mm_value < 0:
+        mm_value = 0
+    km10 = mm_value // 100000
+    return "TR " + str(km10 // 10) + "." + str(km10 % 10)
+
+
+def format_odo_text(mm_value):
+    if mm_value < 0:
+        mm_value = 0
+    km = mm_value // 1000000
+    if km >= 100:
+        return str(km) + " KM"
+
+    km10 = mm_value // 100000
+    return str(km10 // 10) + "." + str(km10 % 10) + " KM"
+
+
+def format_runtime_text(seconds):
+    if seconds < 0:
+        seconds = 0
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    secs = seconds % 60
+    return "RUN " + str(hours) + ":" + "{:02d}".format(mins) + ":" + "{:02d}".format(secs)
+
+
+def update_runtime():
+    global runtime_last_ms, runtime_accum_ms, engine_runtime_s, runtime_dirty
+    now = utime.ticks_ms()
+    dt = utime.ticks_diff(now, runtime_last_ms)
+    runtime_last_ms = now
+    if dt <= 0:
+        return
+
+    runtime_accum_ms += dt
+    if runtime_accum_ms >= 1000:
+        inc_s = runtime_accum_ms // 1000
+        runtime_accum_ms = runtime_accum_ms % 1000
+        engine_runtime_s += inc_s
+        if engine_runtime_s > 999999999:
+            engine_runtime_s = 999999999
+        runtime_dirty = True
+
+
+def maybe_save_persistent_state():
+    global trip_dirty, odo_dirty, runtime_dirty, persistent_last_save_ms
+    if not (trip_dirty or odo_dirty or runtime_dirty):
+        return
+
+    now = utime.ticks_ms()
+    if utime.ticks_diff(now, persistent_last_save_ms) < TRIP_SAVE_INTERVAL_MS:
+        return
+
+    if save_settings():
+        trip_dirty = False
+        odo_dirty = False
+        runtime_dirty = False
+        persistent_last_save_ms = now
 
 
 def button_pressed(pin_obj):
@@ -332,8 +444,28 @@ def button_pressed(pin_obj):
 
 
 def get_button_event():
-    global last_btn_ms
+    global last_btn_ms, ok_press_start_ms, ok_long_fired
     now = utime.ticks_ms()
+
+    if button_pressed(btn_ok):
+        if ok_press_start_ms is None:
+            ok_press_start_ms = now
+            ok_long_fired = False
+        elif (not ok_long_fired) and utime.ticks_diff(now, ok_press_start_ms) >= OK_LONG_PRESS_MS:
+            if utime.ticks_diff(now, last_btn_ms) >= BTN_DEBOUNCE_MS:
+                last_btn_ms = now
+                ok_long_fired = True
+                return "OK_LONG"
+    else:
+        if ok_press_start_ms is not None:
+            held_ms = utime.ticks_diff(now, ok_press_start_ms)
+            was_long = ok_long_fired
+            ok_press_start_ms = None
+            ok_long_fired = False
+            if (not was_long) and held_ms < OK_LONG_PRESS_MS and utime.ticks_diff(now, last_btn_ms) >= BTN_DEBOUNCE_MS:
+                last_btn_ms = now
+                return "OK"
+
     if utime.ticks_diff(now, last_btn_ms) < BTN_DEBOUNCE_MS:
         return None
 
@@ -349,14 +481,11 @@ def get_button_event():
     if button_pressed(btn_right):
         last_btn_ms = now
         return "RIGHT"
-    if button_pressed(btn_ok):
-        last_btn_ms = now
-        return "OK"
     return None
 
 
 def settings_count():
-    return 6
+    return 8
 
 
 def reset_settings_to_defaults():
@@ -369,6 +498,12 @@ def reset_settings_to_defaults():
     speed_pulses_per_rev = SPEED_PULSES_PER_REV
     rpm_bar_max = RPM_BAR_MAX
     speed_multiplier = SPEED_MULTIPLIER
+
+
+def clear_trip():
+    global trip_mm, trip_dirty
+    trip_mm = 0
+    trip_dirty = True
 
 
 def adjust_setting(index, delta):
@@ -415,15 +550,25 @@ def adjust_setting(index, delta):
 
 
 def handle_buttons():
-    global menu_active, menu_index, settings_dirty, reset_confirm_armed
+    global menu_active, info_active, menu_index
+    global settings_dirty, reset_confirm_armed, trip_clear_confirm_armed
+    global trip_dirty, odo_dirty, runtime_dirty
     event = get_button_event()
     if event is None:
         return
 
-    if not menu_active:
+    if not menu_active and not info_active:
         if event == "OK":
             menu_active = True
             reset_confirm_armed = False
+            trip_clear_confirm_armed = False
+        elif event == "OK_LONG":
+            info_active = True
+        return
+
+    if info_active:
+        if event == "OK" or event == "OK_LONG":
+            info_active = False
         return
 
     if event == "OK" and menu_index == 5:
@@ -433,31 +578,54 @@ def handle_buttons():
             reset_settings_to_defaults()
             if save_settings():
                 settings_dirty = False
+                trip_dirty = False
+                odo_dirty = False
+                runtime_dirty = False
             reset_confirm_armed = False
+        return
+
+    if event == "OK" and menu_index == 7:
+        if not trip_clear_confirm_armed:
+            trip_clear_confirm_armed = True
+        else:
+            clear_trip()
+            if save_settings():
+                trip_dirty = False
+                odo_dirty = False
+                runtime_dirty = False
+            trip_clear_confirm_armed = False
         return
 
     if event == "OK":
         if settings_dirty:
             if save_settings():
                 settings_dirty = False
+                trip_dirty = False
+                odo_dirty = False
+                runtime_dirty = False
         reset_confirm_armed = False
+        trip_clear_confirm_armed = False
         menu_active = False
     elif event == "UP":
         reset_confirm_armed = False
+        trip_clear_confirm_armed = False
         menu_index = (menu_index - 1) % settings_count()
     elif event == "DOWN":
         reset_confirm_armed = False
+        trip_clear_confirm_armed = False
         menu_index = (menu_index + 1) % settings_count()
     elif event == "LEFT":
-        if menu_index != 5:
+        if menu_index < 5:
             adjust_setting(menu_index, -1)
         else:
             reset_confirm_armed = False
+            trip_clear_confirm_armed = False
     elif event == "RIGHT":
-        if menu_index != 5:
+        if menu_index < 5:
             adjust_setting(menu_index, 1)
         else:
             reset_confirm_armed = False
+            trip_clear_confirm_armed = False
 
 
 def draw_settings_menu():
@@ -491,11 +659,18 @@ def draw_settings_menu():
             label = "SPPR " + str(speed_pulses_per_rev)
         elif idx == 4:
             label = "RBAR " + str(rpm_bar_max)
-        else:
+        elif idx == 5:
             if reset_confirm_armed:
                 label = "RSET confirm?"
             else:
                 label = "RSET defaults"
+        elif idx == 6:
+            label = "TRIP " + str(trip_mm // 1000000) + "." + str((trip_mm // 100000) % 10) + "km"
+        else:
+            if trip_clear_confirm_armed:
+                label = "TCLR confirm?"
+            else:
+                label = "TCLR clear trip"
 
         mark = ">" if idx == menu_index else " "
         oled.text(mark + label, 0, y, 1)
@@ -507,6 +682,11 @@ def draw_settings_menu():
             help_text = MENU_HELP_RESET_CONFIRM
         else:
             help_text = MENU_HELP_RESET_ARM
+    elif menu_index == 7:
+        if trip_clear_confirm_armed:
+            help_text = MENU_HELP_TCLR_CONFIRM
+        else:
+            help_text = MENU_HELP_TCLR_ARM
 
     if utime.ticks_diff(now, menu_scroll_last_ms) >= MENU_SCROLL_STEP_MS:
         menu_scroll_last_ms = now
@@ -515,6 +695,15 @@ def draw_settings_menu():
         if menu_scroll_x < -text_px:
             menu_scroll_x = 128
     oled.text(help_text, menu_scroll_x, 56, 1)
+
+
+def draw_info_screen():
+    oled.fill(0)
+    oled.text("INFO", 48, 0, 1)
+    oled.text("ODO " + format_odo_text(odo_mm), 0, 14, 1)
+    oled.text(format_trip_text(trip_mm) + " KM", 0, 26, 1)
+    oled.text(format_runtime_text(engine_runtime_s), 0, 38, 1)
+    oled.text("TMP " + format_temp_text(temp), 0, 50, 1)
 
 
 # -----------------------------
@@ -579,6 +768,11 @@ def draw_speed_big(oled, speed_value):
 
 
 def update_display():
+    if info_active:
+        draw_info_screen()
+        oled.show()
+        return
+
     if menu_active:
         draw_settings_menu()
         oled.show()
@@ -638,8 +832,15 @@ def update_display():
         kmh_x = 128 - (len(KMH_TEXT) * 8)
     oled.text(KMH_TEXT, kmh_x, kmh_y, 1)
 
-    # Bottom-right: temp placeholder
-    oled.text(TEMP_TEXT, TEMP_TEXT_X, TEMP_TEXT_Y, 1)
+    # Bottom-left: odometer
+    oled.text(format_odo_text(odo_mm), 0, TEMP_TEXT_Y, 1)
+
+    # Bottom-right: live temp (fault-safe)
+    temp_text = format_temp_text(temp)
+    temp_x = 128 - (len(temp_text) * 8)
+    if temp_x < 0:
+        temp_x = 0
+    oled.text(temp_text, temp_x, TEMP_TEXT_Y, 1)
 
     oled.show()
 
@@ -694,12 +895,18 @@ print("Motorcycle dashboard started")
 try:
     while True:
         handle_buttons()
+        update_runtime()
 
         if display_due:
             display_due = False
             update_display()
 
-        temp = thermocouple.read_temp()
+        try:
+            temp = thermocouple.read_temp()
+        except Exception:
+            temp = None
+
+        maybe_save_persistent_state()
         utime.sleep_ms(MAIN_LOOP_SLEEP_MS)
 
 except KeyboardInterrupt:

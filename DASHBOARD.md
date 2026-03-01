@@ -9,15 +9,26 @@ Current project documentation for the active `main.py` implementation.
 - SSD1306 128x64 OLED over I2C
 - RPM input via GPIO interrupt (inductive pickup front-end)
 - Speed input via GPIO interrupt
-- MAX6675 over SPI (temperature currently shown as placeholder `0C`)
-- 5-button runtime settings menu (saved to onboard filesystem)
+- MAX6675 over SPI (live temperature display with fault fallback)
+- 5-button runtime settings menu + long-press info screen (saved to onboard filesystem)
 
 ## Current UI
 
 - **Top:** RPM horizontal bar with fill, tick marks, and numeric tick labels
 - **Top/Mid:** RPM number + `RPM` label
 - **Center/Bottom:** Large speed digits with `km/h` text to the right
-- **Bottom-right:** temperature placeholder `0C`
+- **Bottom-left:** odometer (`x.x KM`)
+- **Bottom-right:** live temperature (`xxC`) or `TC ERR` on sensor fault
+
+## Info Screen (Long Press)
+
+- From main screen, hold `OK` to open the info screen.
+- Press `OK` again to exit back to main.
+- Info screen shows:
+	- Odometer
+	- Trip distance
+	- Engine runtime
+	- Current temperature / fault text
 
 ## Default Pinout
 
@@ -67,6 +78,7 @@ Button wiring is active-low with internal pull-up:
 
 Controls:
 - `OK`: open/close menu
+- Hold `OK`: open/close info screen
 - `UP` / `DOWN`: select item
 - `LEFT` / `RIGHT`: adjust selected value
 
@@ -77,6 +89,8 @@ Menu entries:
 - `SPPR`: speed pulses per wheel rev (`speed_pulses_per_rev`)
 - `RBAR`: RPM bar max (`rpm_bar_max`)
 - `RSET`: restore defaults and save (press `OK` to arm, `OK` again to confirm)
+- `TRIP`: read-only trip distance
+- `TCLR`: clear trip and save (press `OK` to arm, `OK` again to confirm)
 
 Menu footer uses a single scrolling help line for button hints.
 
@@ -85,6 +99,7 @@ Menu footer uses a single scrolling help line for button hints.
 - `rpm_timer`: updates RPM estimator at `RPM_UPDATE_HZ`
 - `display_timer`: sets display-due flag at `DISPLAY_UPDATE_HZ`
 - Main loop renders display and reads MAX6675
+- Odometer, trip, and runtime auto-save periodically
 
 ## Tuning Guide (One Place)
 
