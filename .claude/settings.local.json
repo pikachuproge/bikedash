@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Process | Where-Object { $_.Name -match 'thonny|putty|arduino|mpremote|python|minicom|hterm|realterm|teraterm|cutecom|screenrc|serialport|node|code' } | Select-Object Name, Id)",
+      "PowerShell(& \"C:\\\\Windows\\\\System32\\\\handle.exe\" -a COM4 2>$null)",
+      "PowerShell(if \\(-not $?\\) { \"handle.exe not found - trying via PowerShell\" })",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/yesbr/bike2/ecu/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('c:/Users/yesbr/bike2/ecu/config_layer.py'\\).read\\(\\)\\); ast.parse\\(open\\('c:/Users/yesbr/bike2/dash/main.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}

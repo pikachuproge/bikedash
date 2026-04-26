@@ -1,0 +1,55 @@
+Net,Node A,Node B,Notes
+VSYS_IN,BAT+,D1.ANODE,Battery input
+VSYS_PROT,D1.CATHODE,SW1.1,Reverse protection to switch
+VSYS,SW1.2,PICO.VSYS,Main system rail
+VSYS,C1.POS,VSYS bulk capacitor
+VSYS,C2.1,Local decoupling
+GND,PICO.GND,C1.NEG,Common ground
+GND,PICO.GND,C2.2,Common ground
+GND,PICO.GND,ALL_GND,Star/common return
+BAT_MON_TOP,BAT+,R6.1,Battery monitor divider top
+BAT_MON_MID,R6.2,PICO.GP26_ADC0,ADC input node
+BAT_MON_MID,R6.2,R7.1,Divider midpoint
+BAT_MON_BOTTOM,R7.2,GND,Divider bottom
+BAT_MON_MID,C4.1,Optional ADC filter
+GND,C4.2,GND,Optional ADC filter return
+RPM_SIG_IN,SPARK_PICKUP,R1.1,Input from pickup front-end
+RPM_BASE,R1.2,Q1.B,Base drive
+RPM_BASE,R2.1,R1.2,Base pull-down top
+GND,R2.2,GND,Base pull-down bottom
+RPM_COLLECTOR,Q1.C,PICO.GP2,RPM logic signal to Pico
+RPM_PULLUP,R3.1,3V3,Collector pull-up top
+RPM_COLLECTOR,R3.2,Q1.C,Collector pull-up bottom
+GND,Q1.E,GND,Transistor emitter
+RPM_CLAMP,Z1.CATHODE,RPM_BASE,Zener clamp cathode at base
+GND,Z1.ANODE,GND,Zener clamp anode
+SPD_IN_RAW,HALL_OUT,R4.1,Speed sensor input
+SPD_NODE,R4.2,PICO.GP3,Speed input node
+SPD_NODE,R5.1,PICO.GP3,Speed pull-down top
+GND,R5.2,GND,Speed pull-down bottom
+SPD_NODE,C3.1,PICO.GP3,Optional speed filter
+GND,C3.2,GND,Optional speed filter return
+I2C_SDA,PICO.GP0,OLED.SDA,Display data
+I2C_SCL,PICO.GP1,OLED.SCL,Display clock
+SPI_MISO,PICO.GP16,MAX6675.SO,Thermocouple data out
+SPI_CS,PICO.GP17,MAX6675.CS,Chip select
+SPI_SCK,PICO.GP18,MAX6675.SCK,Serial clock
+SPI_MOSI,PICO.GP19,MAX6675.SI,Unused by MAX6675 but routed
+BTN_UP,PICO.GP6,BTN_CONN.UP,Active-low button
+BTN_DOWN,PICO.GP7,BTN_CONN.DOWN,Active-low button
+BTN_LEFT,PICO.GP8,BTN_CONN.LEFT,Active-low button
+BTN_RIGHT,PICO.GP9,BTN_CONN.RIGHT,Active-low button
+BTN_OK,PICO.GP10,BTN_CONN.OK,Active-low button
+BTN_GND,GND,BTN_CONN.GND,Common return
+3V3,PICO.3V3_OUT,OLED.VCC,Display supply
+3V3,PICO.3V3_OUT,MAX6675.VCC,Thermocouple module supply
+GND,GND,OLED.GND,Display return
+GND,GND,MAX6675.GND,Thermocouple module return
+TEST_GP2,PICO.GP2,TP_GP2,Test pad
+TEST_GP3,PICO.GP3,TP_GP3,Test pad
+TEST_GP16,PICO.GP16,TP_GP16,Test pad
+TEST_GP17,PICO.GP17,TP_GP17,Test pad
+TEST_GP18,PICO.GP18,TP_GP18,Test pad
+TEST_3V3,PICO.3V3_OUT,TP_3V3,Test pad
+TEST_VSYS,PICO.VSYS,TP_VSYS,Test pad
+TEST_GND,GND,TP_GND,Test pad

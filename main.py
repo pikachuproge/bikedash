@@ -15,7 +15,7 @@ micropython.alloc_emergency_exception_buf(100)
 I2C_ID = const(0)
 I2C_SDA = const(0)
 I2C_SCL = const(1)
-I2C_FREQ = const(400000)
+I2C_FREQ = const(1000000)
 OLED_ADDR = const(0x3C)
 OLED_DRIVER = "SSD1306"  # "SSD1306" or "SSD1309"
 
@@ -46,20 +46,23 @@ BTN_DOWN_PIN = const(7)
 BTN_LEFT_PIN = const(8)
 BTN_RIGHT_PIN = const(9)
 BTN_OK_PIN = const(10)
-BTN_DEBOUNCE_MS = const(140)
+BTN_DEBOUNCE_MS = const(100)
 OK_LONG_PRESS_MS = const(800)
 MENU_SCROLL_STEP_MS = const(50)
 
 # Display refresh and loop timing
-RPM_UPDATE_HZ = const(20)
-DISPLAY_UPDATE_HZ = const(10)
-MAIN_LOOP_SLEEP_MS = const(20)
+RPM_UPDATE_HZ = const(30)
+DISPLAY_UPDATE_HZ = const(60)
+MAIN_LOOP_SLEEP_MS = const(10)
 TRIP_SAVE_INTERVAL_MS = const(15000)
 TEMP_READ_INTERVAL_MS = const(250)
 SAVE_WHEN_RPM_BELOW = const(1800)
 SENSOR_STATUS_TIMEOUT_MS = const(3000)
 DEBUG_OVERLAY_DEFAULT = const(0)
 DEMO_MODE_DEFAULT = const(1)
+GRAPH_HISTORY_LEN = const(96)
+GRAPH_SAMPLE_MS = const(200)
+GRAPH_VIEW_POINTS = (24, 48, 72, 96)
 
 # UI layout
 RPM_BAR_X = const(4)
@@ -106,7 +109,13 @@ class SSD1306(framebuf.FrameBuffer):
         self._init_display()
 
     def _write_cmd(self, cmd):
-        self.i2c.writeto(self.addr, bytes((0x00, cmd)))
+        try:
+            self.i2c.writeto(self.addr, bytes((0x00, cmd)))
+            return True
+        except OSError:
+            return False
+        except Exception:
+            return False
 
     def _init_display(self):
         driver = self.driver.upper()
@@ -148,18 +157,29 @@ class SSD1306(framebuf.FrameBuffer):
             )
 
         for cmd in cmds:
-            self._write_cmd(cmd)
+            if not self._write_cmd(cmd):
+                return False
         self.fill(0)
         self.show()
+        return True
 
     def show(self):
-        for page in range(self.pages):
-            self._write_cmd(0xB0 | page)
-            self._write_cmd(0x00)
-            self._write_cmd(0x10)
-            start = self.width * page
-            end = start + self.width
-            self.i2c.writeto(self.addr, b"\x40" + self.buffer[start:end])
+        try:
+            for page in range(self.pages):
+                if not self._write_cmd(0xB0 | page):
+                    return False
+                if not self._write_cmd(0x00):
+                    return False
+                if not self._write_cmd(0x10):
+                    return False
+                start = self.width * page
+                end = start + self.width
+                self.i2c.writeto(self.addr, b"\x40" + self.buffer[start:end])
+            return True
+        except OSError:
+            return False
+        except Exception:
+            return False
 
 
 # -----------------------------
@@ -172,18 +192,22 @@ class MAX6675:
         self.cs.on()
 
     def read_temp(self):
+        temp_val, _ = self.read_temp_with_diag()
+        return temp_val
+
+    def read_temp_with_diag(self):
         self.cs.off()
         utime.sleep_us(1)
         raw = self.spi.read(2)
         self.cs.on()
 
         if not raw or len(raw) != 2:
-            return None
+            return None, "RAW ----"
 
         value = (raw[0] << 8) | raw[1]
         if value & 0x0004:
-            return None
-        return ((value >> 3) & 0x0FFF) * 0.25
+            return None, "RAW " + hex(value) + " O1"
+        return ((value >> 3) & 0x0FFF) * 0.25, "RAW " + hex(value) + " O0"
 
 
 # -----------------------------
@@ -200,8 +224,10 @@ spd_value = 0
 speed_last_pulse_ms = utime.ticks_ms()
 
 temp = None
+temp_diag = "RAW ----"
 temp_last_read_ms = utime.ticks_ms()
 display_due = False
+display_last_recover_ms = utime.ticks_ms()
 
 # Runtime-tunable values (editable from menu)
 rpm_debounce_us = RPM_DEBOUNCE_US
@@ -215,6 +241,10 @@ speed_last_update_ms = utime.ticks_ms()
 # Menu state
 menu_active = False
 info_active = False
+graph_active = False
+graph_channel = 0  # 0=RPM, 1=SPD, 2=TMP
+graph_view_idx = 2  # default view span from GRAPH_VIEW_POINTS
+graph_paused = False
 menu_index = 0
 last_btn_ms = 0
 ok_press_start_ms = None
@@ -244,6 +274,12 @@ demo_mode_enabled = DEMO_MODE_DEFAULT
 debug_loop_ms = 0
 demo_last_ms = utime.ticks_ms()
 demo_phase = 0
+graph_hist_rpm = [0] * GRAPH_HISTORY_LEN
+graph_hist_spd = [0] * GRAPH_HISTORY_LEN
+graph_hist_tmp = [0] * GRAPH_HISTORY_LEN
+graph_hist_head = 0
+graph_hist_count = 0
+graph_last_sample_ms = utime.ticks_ms()
 
 
 def clamp(value, low, high):
@@ -474,6 +510,129 @@ def get_sensor_status_text():
     return "R" + ("+" if rpm_ok else "-") + " S" + ("+" if speed_ok else "-") + " T" + ("+" if temp_ok else "-")
 
 
+def update_history_samples():
+    global graph_hist_head, graph_hist_count, graph_last_sample_ms
+
+    now = utime.ticks_ms()
+    if utime.ticks_diff(now, graph_last_sample_ms) < GRAPH_SAMPLE_MS:
+        return
+    graph_last_sample_ms = now
+
+    temp_val = -1
+    if temp is not None:
+        temp_val = int(temp + 0.5)
+
+    graph_hist_rpm[graph_hist_head] = get_rpm()
+    graph_hist_spd[graph_hist_head] = spd_value
+    graph_hist_tmp[graph_hist_head] = temp_val
+
+    graph_hist_head = (graph_hist_head + 1) % GRAPH_HISTORY_LEN
+    if graph_hist_count < GRAPH_HISTORY_LEN:
+        graph_hist_count += 1
+
+
+def get_hist_value(channel, idx):
+    if channel == 0:
+        return graph_hist_rpm[idx]
+    if channel == 1:
+        return graph_hist_spd[idx]
+    return graph_hist_tmp[idx]
+
+
+def format_graph_axis_value(channel, value):
+    if channel == 0:
+        return str(value // 1000) + "k"
+    return str(value)
+
+
+def draw_history_graph(channel):
+    oled.fill(0)
+
+    if channel == 0:
+        title = "GR RPM"
+        min_v = 0
+        max_v = rpm_bar_max if rpm_bar_max > 0 else 10000
+    elif channel == 1:
+        title = "GR SPD"
+        min_v = 0
+        max_v = 120
+    else:
+        title = "GR TMP"
+        min_v = 0
+        max_v = 200
+
+    oled.text(title, 0, 0, 1)
+    if graph_paused:
+        oled.text("PAUSE", 72, 0, 1)
+    oled.text("U/D span L/R ch", 0, 56, 1)
+
+    gx = 24
+    gy = 12
+    gw = 102
+    gh = 30
+    oled.rect(gx, gy, gw, gh, 1)
+
+    # Grid lines (value/time guides)
+    for i in range(1, 4):
+        yy = gy + int((i * (gh - 1)) / 4)
+        oled.hline(gx + 1, yy, gw - 2, 1)
+    for i in range(1, 4):
+        xx = gx + int((i * (gw - 1)) / 4)
+        oled.vline(xx, gy + 1, gh - 2, 1)
+
+    mid_v = min_v + ((max_v - min_v) // 2)
+    oled.text(format_graph_axis_value(channel, max_v), 0, gy - 2, 1)
+    oled.text(format_graph_axis_value(channel, mid_v), 0, gy + (gh // 2) - 4, 1)
+    oled.text(format_graph_axis_value(channel, min_v), 0, gy + gh - 8, 1)
+
+    visible_count = GRAPH_VIEW_POINTS[graph_view_idx]
+    if graph_hist_count < visible_count:
+        visible_count = graph_hist_count
+
+    if visible_count < 2:
+        oled.text("collecting...", 28, 30, 1)
+        return
+
+    start = graph_hist_head - visible_count
+    while start < 0:
+        start += GRAPH_HISTORY_LEN
+
+    prev_x = gx + 1
+    prev_y = gy + gh - 2
+
+    for i in range(visible_count):
+        idx = (start + i) % GRAPH_HISTORY_LEN
+        val = get_hist_value(channel, idx)
+        if val < min_v:
+            val = min_v
+        if val > max_v:
+            val = max_v
+
+        x = gx + 1 + int((i * (gw - 3)) / (visible_count - 1))
+        y = gy + gh - 2 - int(((val - min_v) * (gh - 3)) / (max_v - min_v if (max_v - min_v) > 0 else 1))
+
+        oled.line(prev_x, prev_y, x, y, 1)
+        prev_x = x
+        prev_y = y
+
+    span_s = (visible_count * GRAPH_SAMPLE_MS) // 1000
+    oled.text("-" + str(span_s) + "s", gx, 44, 1)
+    oled.text("now", gx + gw - 24, 44, 1)
+
+    last_idx = graph_hist_head - 1
+    if last_idx < 0:
+        last_idx = GRAPH_HISTORY_LEN - 1
+    last_val = get_hist_value(channel, last_idx)
+    if channel == 2 and last_val < 0:
+        oled.text("--C", 88, 0, 1)
+    elif channel == 0:
+        oled.text(str(last_val), 88, 0, 1)
+    elif channel == 1:
+        oled.text(str(last_val) + "k", 88, 0, 1)
+    else:
+        oled.text(str(last_val) + "C", 88, 0, 1)
+
+
 def update_demo_values():
     global demo_last_ms, demo_phase
     global rpm_value, spd_value, temp
@@ -686,14 +845,17 @@ def adjust_setting(index, delta):
 
 
 def handle_buttons():
-    global menu_active, info_active, menu_index
+    global menu_active, info_active, graph_active, graph_channel, graph_view_idx, graph_paused, menu_index
     global settings_dirty, reset_confirm_armed, trip_clear_confirm_armed
     global trip_dirty, odo_dirty, runtime_dirty
+
+    graph_paused = graph_active and button_pressed(btn_up) and button_pressed(btn_down)
+
     event = get_button_event()
     if event is None:
         return
 
-    if not menu_active and not info_active:
+    if not menu_active and not info_active and not graph_active:
         if event == "OK":
             menu_active = True
             reset_confirm_armed = False
@@ -702,9 +864,29 @@ def handle_buttons():
             info_active = True
         return
 
+    if graph_active:
+        if graph_paused:
+            return
+        if event == "OK" or event == "OK_LONG":
+            graph_active = False
+        elif event == "LEFT":
+            graph_channel = (graph_channel - 1) % 3
+        elif event == "RIGHT":
+            graph_channel = (graph_channel + 1) % 3
+        elif event == "UP":
+            if graph_view_idx < (len(GRAPH_VIEW_POINTS) - 1):
+                graph_view_idx += 1
+        elif event == "DOWN":
+            if graph_view_idx > 0:
+                graph_view_idx -= 1
+        return
+
     if info_active:
         if event == "OK" or event == "OK_LONG":
             info_active = False
+        elif event == "RIGHT":
+            info_active = False
+            graph_active = True
         return
 
     if event == "OK" and menu_index == 7:
@@ -842,8 +1024,8 @@ def draw_info_screen():
     oled.text("INFO " + get_sensor_status_text(), 0, 0, 1)
     oled.text("ODO " + format_odo_text(odo_mm), 0, 14, 1)
     oled.text(format_trip_text(trip_mm) + " KM", 0, 26, 1)
-    oled.text(format_runtime_text(engine_runtime_s), 0, 38, 1)
-    oled.text("TMP " + format_temp_text(temp), 0, 50, 1)
+    oled.text("TMP " + format_temp_text(temp), 0, 38, 1)
+    oled.text(temp_diag, 0, 50, 1)
 
 
 # -----------------------------
@@ -907,15 +1089,50 @@ def draw_speed_big(oled, speed_value):
     return (128 - total_w) // 2, total_w, y
 
 
+def recover_oled():
+    global i2c, oled, display_last_recover_ms
+    now = utime.ticks_ms()
+    if utime.ticks_diff(now, display_last_recover_ms) < 150:
+        return False
+
+    display_last_recover_ms = now
+    try:
+        i2c = I2C(I2C_ID, scl=Pin(I2C_SCL), sda=Pin(I2C_SDA), freq=I2C_FREQ)
+        oled = SSD1306(128, 64, i2c, OLED_ADDR, OLED_DRIVER)
+        return True
+    except Exception:
+        return False
+
+
+def show_oled_safe():
+    try:
+        ok = oled.show()
+        if ok:
+            return True
+        recover_oled()
+        return False
+    except OSError:
+        recover_oled()
+        return False
+    except Exception:
+        recover_oled()
+        return False
+
+
 def update_display():
+    if graph_active:
+        draw_history_graph(graph_channel)
+        show_oled_safe()
+        return
+
     if info_active:
         draw_info_screen()
-        oled.show()
+        show_oled_safe()
         return
 
     if menu_active:
         draw_settings_menu()
-        oled.show()
+        show_oled_safe()
         return
 
     rpm_now = get_rpm()
@@ -993,7 +1210,7 @@ def update_display():
             dbg_x = 0
         oled.text(dbg_text, dbg_x, 0, 1)
 
-    oled.show()
+    show_oled_safe()
 
 
 # -----------------------------
@@ -1050,16 +1267,17 @@ def init_timers():
 
 
 def update_sensors():
-    global temp, temp_last_read_ms
+    global temp, temp_diag, temp_last_read_ms
     now = utime.ticks_ms()
     if utime.ticks_diff(now, temp_last_read_ms) < TEMP_READ_INTERVAL_MS:
         return
 
     temp_last_read_ms = now
     try:
-        temp = thermocouple.read_temp()
+        temp, temp_diag = thermocouple.read_temp_with_diag()
     except Exception:
         temp = None
+        temp_diag = "RAW EXC"
 
 
 def run_dashboard_loop():
@@ -1082,6 +1300,9 @@ def run_dashboard_loop():
 
             update_display()
 
+            if not (graph_active and graph_paused):
+                update_history_samples()
+
         if not demo_mode_enabled:
             update_sensors()
         maybe_save_persistent_state()
@@ -1092,8 +1313,11 @@ def run_dashboard_loop():
 def stop_dashboard():
     rpm_timer.deinit()
     display_timer.deinit()
-    oled.fill(0)
-    oled.show()
+    try:
+        oled.fill(0)
+        show_oled_safe()
+    except Exception:
+        pass
 
 
 def start_dashboard():

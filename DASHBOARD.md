@@ -24,12 +24,21 @@ Current project documentation for the active `main.py` implementation.
 
 - From main screen, hold `OK` to open the info screen.
 - Press `OK` again to exit back to main.
+- Press `RIGHT` from info screen to open history graphs.
 - Info screen shows:
 	- Odometer
 	- Trip distance
 	- Engine runtime
 	- Current temperature / fault text
 	- Sensor status flags (`R/S/T`, `+`=recent signal, `-`=stale/fault)
+
+## History Graph Screen
+
+- Graph channels: RPM, Speed, Temperature
+- Controls:
+	- `LEFT` / `RIGHT`: switch channel
+	- `OK`: exit graph screen
+- Samples are stored in a rolling history buffer and plotted over time.
 
 ## Default Pinout
 

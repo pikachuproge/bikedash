@@ -70,6 +70,15 @@ Shows:
 - Temperature / fault state
 - Sensor status flags (`R/S/T` where `+`=recent signal, `-`=stale/fault)
 
+From the info screen, press `RIGHT` to open history graphs.
+
+## History Graphs
+
+- Channels: RPM, Speed, Temperature
+- `LEFT` / `RIGHT` switches channel
+- `OK` exits graph screen
+- Uses rolling sampled history for bench and ride diagnostics
+
 ## Field Validation Checklist (v0.3 beta)
 
 1. Power-on sanity
