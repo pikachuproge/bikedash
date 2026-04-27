@@ -32,17 +32,21 @@ def crc16_ccitt(data):
 
 def default_profile():
     # Defaults sized for Strategy B (multi-tooth Hall on the dry-clutch ring
-    # gear with one tooth filed off). 90 teeth is a placeholder; the real
-    # tooth count must be confirmed by visual inspection on engine arrival
-    # and `teeth_per_rev` updated to match the original (un-filed) count.
+    # gear with one tooth filed off), with the ring gear treated as a
+    # REDUCTION gear: ring gear teeth-per-crank-rev = ring_gear_physical_teeth
+    # / reduction_ratio. Worked example: 84 physical teeth with 4:1 reduction
+    # gives teeth_per_rev = 21. Confirm the actual ratio on engine arrival
+    # (mark crank + ring gear, count crank revs per ring gear rev) and update
+    # `teeth_per_rev` to match.
     return {
         "schema": 1,
-        "teeth_per_rev": 90,
+        "teeth_per_rev": 21,
         "sync_tooth_index": 0,
-        "tooth_min_us": 50,
-        "tooth_max_us": 30000,
+        "tooth_min_us": 300,
+        "tooth_max_us": 8000,
         "debounce_us": 40,
         "sync_edges_to_lock": 8,
+        "missing_tooth_ratio": 1.8,
         "safe_fire_delay_us": 2500,
         "safe_dwell_us": 1700,
         "advance_map_rpm": [1000, 2000, 3000, 5000, 7000, 9000],
@@ -93,15 +97,26 @@ def sanitize_profile(profile):
             base[k] = profile[k]
 
     base["schema"] = 1
-    base["teeth_per_rev"] = _clamp(int(base.get("teeth_per_rev", 36)), 8, 240)
+    base["teeth_per_rev"] = _clamp(int(base.get("teeth_per_rev", 21)), 8, 240)
     base["sync_tooth_index"] = _clamp(int(base.get("sync_tooth_index", 0)), 0, base["teeth_per_rev"] - 1)
-    base["tooth_min_us"] = _clamp(int(base.get("tooth_min_us", 80)), 20, 20000)
-    base["tooth_max_us"] = _clamp(int(base.get("tooth_max_us", 120000)), 200, 500000)
+    base["tooth_min_us"] = _clamp(int(base.get("tooth_min_us", 300)), 20, 20000)
+    base["tooth_max_us"] = _clamp(int(base.get("tooth_max_us", 8000)), 200, 500000)
     if base["tooth_max_us"] <= base["tooth_min_us"]:
         base["tooth_max_us"] = base["tooth_min_us"] + 200
 
     base["debounce_us"] = _clamp(int(base.get("debounce_us", 40)), 10, 5000)
     base["sync_edges_to_lock"] = _clamp(int(base.get("sync_edges_to_lock", 8)), 1, 64)
+
+    try:
+        mtr = float(base.get("missing_tooth_ratio", 1.8))
+    except (TypeError, ValueError):
+        mtr = 1.8
+    if mtr < 1.2:
+        mtr = 1.2
+    elif mtr > 3.0:
+        mtr = 3.0
+    base["missing_tooth_ratio"] = mtr
+
     base["safe_fire_delay_us"] = _clamp(int(base.get("safe_fire_delay_us", 2500)), 500, 25000)
     base["safe_dwell_us"] = _clamp(int(base.get("safe_dwell_us", 1700)), 800, 4000)
 

@@ -99,7 +99,7 @@ CFG_TX_CHUNK_MAX = const(48)
 # UI layout
 RPM_BAR_X = const(4)
 RPM_BAR_Y = const(2)
-RPM_BAR_W = const(120)
+RPM_BAR_W = const(124)
 RPM_BAR_H = const(10)
 RPM_TICK_COUNT = const(5)
 RPM_TICK_Y_OFFSET = const(11)
@@ -131,7 +131,9 @@ PROTO_MINOR = const(0)
 MSG_TYPE_ENGINE_STATE = const(1)
 MSG_TYPE_CONFIG_SET = const(2)
 MSG_TYPE_CONFIG_RESPONSE = const(3)
-MAX_PAYLOAD_LEN = const(128)
+# Bumped from 128 to fit the optional TLV_FAULT_LOG payload (up to
+# 8 entries x 20 bytes = 160 bytes) alongside the existing TLVs.
+MAX_PAYLOAD_LEN = const(256)
 
 TLV_RPM_U16 = const(1)
 TLV_SYNC_STATE_U8 = const(2)
@@ -143,6 +145,26 @@ TLV_TEMP_C_X10_I16 = const(7)
 TLV_ECU_CYCLE_ID_U32 = const(8)
 TLV_SPARK_COUNTER_U32 = const(9)
 TLV_IGNITION_OUTPUT_STATE_U8 = const(10)
+TLV_FAULT_LOG = const(11)
+
+# Fault log entry layout (must match ECU build_payload encoding):
+# fault_bit u32 LE | rpm u16 LE | tooth_period_us u32 LE | avg_period_us u32 LE | timestamp_ms u32 LE | count u16 LE
+FAULT_LOG_ENTRY_LEN = const(20)
+FAULT_LOG_MAX_ENTRIES = const(8)
+
+# ECU fault bit numeric values (must match ecu/main.py).
+FAULT_SYNC_TIMEOUT = const(1)
+FAULT_EDGE_PLAUSIBILITY = const(2)
+FAULT_UNSCHEDULABLE = const(4)
+FAULT_STALE_EVENT = const(8)
+FAULT_ISR_OVERRUN = const(16)
+FAULT_SAFETY_INHIBIT = const(32)
+FAULT_UNSTABLE_SYNC = const(64)
+
+# ECU ignition modes
+IGN_MODE_INHIBIT = const(0)
+IGN_MODE_SAFE = const(1)
+IGN_MODE_PRECISION = const(2)
 
 TLV_CFG_MODE_U8 = const(1)
 TLV_CFG_JSON = const(2)
@@ -269,6 +291,56 @@ def build_default_adv_map_cd(rpm_points):
         cd = 600 + ((rpm * 16) // 100)
         out.append(clamp(cd, TIMING_MAP_ADV_MIN_CD, TIMING_MAP_ADV_MAX_CD))
     return out
+
+
+def _interp_map(rpm, x_points, y_points):
+    # Same algorithm as ECU _interp_map: clamp to endpoints, otherwise
+    # piecewise-linear interpolation in integer space. Used by the dash to
+    # mirror the ECU's commanded advance locally for the ADV display.
+    n = len(x_points)
+    if n <= 0 or n != len(y_points):
+        return 0
+    if rpm <= x_points[0]:
+        return y_points[0]
+    i = 1
+    while i < n:
+        if rpm <= x_points[i]:
+            x0 = x_points[i - 1]
+            x1 = x_points[i]
+            y0 = y_points[i - 1]
+            y1 = y_points[i]
+            if x1 <= x0:
+                return y1
+            return y0 + ((rpm - x0) * (y1 - y0)) // (x1 - x0)
+        i += 1
+    return y_points[n - 1]
+
+
+# Plain-English fault descriptions for the FLOG screen. The ECU transmits
+# raw bit values; the dash maps each to a short label and a longer line.
+FAULT_NAMES = (
+    (FAULT_SYNC_TIMEOUT,      "SYNC TIMEOUT",  "No teeth seen >250ms"),
+    (FAULT_EDGE_PLAUSIBILITY, "EDGE BAD",      "Implausible tooth edge"),
+    (FAULT_UNSCHEDULABLE,     "UNSCHED",       "Fire delay too short"),
+    (FAULT_STALE_EVENT,       "STALE FIRE",    "Missed fire window"),
+    (FAULT_ISR_OVERRUN,       "ISR SLOW",      "ISR took >20us"),
+    (FAULT_SAFETY_INHIBIT,    "KILL ACTIVE",   "Kill switch open"),
+    (FAULT_UNSTABLE_SYNC,     "SYNC UNSTABLE", "Noise on crank signal"),
+)
+
+
+def fault_short_name(bit):
+    for fbit, short, _ in FAULT_NAMES:
+        if fbit == bit:
+            return short
+    return "FLT 0x" + "{:X}".format(bit & 0xFFFFFFFF)
+
+
+def fault_long_name(bit):
+    for fbit, _, long in FAULT_NAMES:
+        if fbit == bit:
+            return long
+    return "Unknown fault"
 
 
 def file_exists(path):
@@ -416,6 +488,11 @@ class EngineSnapshot:
         self.spark_counter = 0
         self.ign_output = 0
 
+        # Structured fault log mirrored from ECU. Each entry is a tuple of
+        # (fault_bit, rpm, tooth_period_us, avg_period_us, timestamp_ms, count).
+        # Empty list = ECU reports no faults.
+        self.fault_log = []
+
 
 class TelemetryIngest:
     ST_SEEK_0 = const(0)
@@ -469,6 +546,7 @@ class TelemetryIngest:
         self.dec_ecu_cycle_id = 0
         self.dec_spark_counter = 0
         self.dec_ign_output = 0
+        self.dec_fault_log = []
 
     def _reset(self):
         self.state = self.ST_SEEK_0
@@ -629,6 +707,7 @@ class TelemetryIngest:
         snap.ecu_cycle_id = self.dec_ecu_cycle_id
         snap.spark_counter = self.dec_spark_counter
         snap.ign_output = self.dec_ign_output
+        snap.fault_log = self.dec_fault_log
         self.has_snapshot = True
         self.last_seq = self.dec_seq
         self.last_rx_ms = self.dec_rx_time_ms
@@ -649,6 +728,7 @@ class TelemetryIngest:
         ecu_cycle_id = 0
         spark_counter = 0
         ign_output = 0
+        fault_log = []
         rx_time_ms = utime.ticks_ms()
 
         while idx < payload_len:
@@ -724,6 +804,26 @@ class TelemetryIngest:
                     return False
                 ign_output = payload[idx]
 
+            elif field_type == TLV_FAULT_LOG:
+                # Length must be a non-zero multiple of FAULT_LOG_ENTRY_LEN
+                # and bounded by FAULT_LOG_MAX_ENTRIES. Fail the frame if
+                # malformed so we never display garbage in the FLOG screen.
+                if field_len == 0 or (field_len % FAULT_LOG_ENTRY_LEN) != 0:
+                    return False
+                n_entries = field_len // FAULT_LOG_ENTRY_LEN
+                if n_entries > FAULT_LOG_MAX_ENTRIES:
+                    return False
+                fault_log = []
+                for k in range(n_entries):
+                    off = idx + (k * FAULT_LOG_ENTRY_LEN)
+                    fbit = u32_from_le(payload, off)
+                    fr = u16_from_le(payload, off + 4)
+                    ft = u32_from_le(payload, off + 6)
+                    fa = u32_from_le(payload, off + 10)
+                    fts = u32_from_le(payload, off + 14)
+                    fc = u16_from_le(payload, off + 18)
+                    fault_log.append((fbit, fr, ft, fa, fts, fc))
+
             # Unknown TLV fields are safely skipped.
             idx += field_len
 
@@ -744,6 +844,7 @@ class TelemetryIngest:
         self.dec_ecu_cycle_id = ecu_cycle_id
         self.dec_spark_counter = spark_counter
         self.dec_ign_output = ign_output
+        self.dec_fault_log = fault_log
         return True
 
     def _decode_cfg_response(self, payload, payload_len):
@@ -898,6 +999,22 @@ class EngineSnapshotAdapter:
             return (t + 5) // 10
         return -((-t + 5) // 10)
 
+    def get_fault_log(self):
+        # Return a snapshot tuple (entries, ecu_time_ms) so the caller can
+        # compute "seconds since last" against the same ECU timeline that
+        # produced each entry's timestamp_ms.
+        irq = disable_irq()
+        has_snapshot = self.ingest.has_snapshot
+        if has_snapshot:
+            snap = self.ingest.snapshot
+            entries = list(snap.fault_log)
+            ecu_time_ms = snap.ecu_time_ms
+        else:
+            entries = []
+            ecu_time_ms = 0
+        enable_irq(irq)
+        return entries, ecu_time_ms
+
 
 # -----------------------------
 # Runtime state
@@ -936,6 +1053,8 @@ telemetry_dist_last_ms = utime.ticks_ms()
 menu_active = False
 info_active = False
 graph_active = False
+flog_active = False
+flog_index = 0
 map_editor_active = False
 graph_channel = 0  # 0=RPM, 1=SPD, 2=TMP
 graph_view_idx = 2
@@ -978,12 +1097,16 @@ debug_loop_ms = 0
 demo_last_ms = utime.ticks_ms()
 demo_phase = 0
 
-ecu_teeth_per_rev = 90
+ecu_teeth_per_rev = 21
 ecu_sync_tooth_index = 0
-ecu_tooth_min_us = 50
-ecu_tooth_max_us = 30000
+ecu_tooth_min_us = 300
+ecu_tooth_max_us = 8000
 ecu_safe_fire_delay_us = 2500
 ecu_safe_dwell_us = 1700
+# Stored as ratio*10 so the menu adjusts in integer 0.1 steps. Sent over
+# the wire as a float (mtr alias -> missing_tooth_ratio) — see
+# build_ecu_config_payload below.
+ecu_missing_tooth_ratio_x10 = 18
 ecu_adv_map_rpm = [TIMING_MAP_RPM_MIN + (i * TIMING_MAP_RPM_STEP) for i in range((TIMING_MAP_RPM_MAX // TIMING_MAP_RPM_STEP) + 1)]
 ecu_adv_map_cd = build_default_adv_map_cd(ecu_adv_map_rpm)
 
@@ -1038,6 +1161,9 @@ class _NullEngineAdapter:
     def get_display_temp(self):
         return None
 
+    def get_fault_log(self):
+        return [], 0
+
 
 telemetry_ingest = _NullTelemetryIngest()
 engine_adapter = _NullEngineAdapter()
@@ -1053,6 +1179,7 @@ def load_settings():
     global trip_mm, odo_mm, engine_runtime_s, debug_overlay_enabled, demo_mode_enabled
     global ecu_teeth_per_rev, ecu_sync_tooth_index, ecu_tooth_min_us, ecu_tooth_max_us
     global ecu_safe_fire_delay_us, ecu_safe_dwell_us, ecu_adv_map_cd
+    global ecu_missing_tooth_ratio_x10
 
     tmp_file = SETTINGS_FILE + ".tmp"
     if file_exists(tmp_file):
@@ -1090,6 +1217,7 @@ def load_settings():
             ecu_tooth_max_us = ecu_tooth_min_us + 200
         ecu_safe_fire_delay_us = clamp(int(data.get("ecu_safe_fire_delay_us", ecu_safe_fire_delay_us)), 500, 25000)
         ecu_safe_dwell_us = clamp(int(data.get("ecu_safe_dwell_us", ecu_safe_dwell_us)), 800, 4000)
+        ecu_missing_tooth_ratio_x10 = clamp(int(data.get("ecu_missing_tooth_ratio_x10", ecu_missing_tooth_ratio_x10)), 12, 30)
 
         cd_list = data.get("ecu_adv_map_cd", ecu_adv_map_cd)
         if isinstance(cd_list, list) and len(cd_list) == len(ecu_adv_map_rpm):
@@ -1120,6 +1248,7 @@ def save_settings():
         "ecu_tooth_max_us": ecu_tooth_max_us,
         "ecu_safe_fire_delay_us": ecu_safe_fire_delay_us,
         "ecu_safe_dwell_us": ecu_safe_dwell_us,
+        "ecu_missing_tooth_ratio_x10": ecu_missing_tooth_ratio_x10,
         "ecu_adv_map_cd": ecu_adv_map_cd,
     }
     tmp_file = SETTINGS_FILE + ".tmp"
@@ -1490,23 +1619,22 @@ def format_graph_axis_value(channel, value):
 
 
 def draw_ecu_link_badge():
+    # Status square only (no text), middle-left at x=0, y=32. 6x6px.
     if LEGACY_LOCAL_ENGINE_ENABLE:
-        oled.text("ECU", 100, 0, 1)
-        oled.fill_rect(120, 1, 4, 4, 1)
+        oled.fill_rect(0, 32, 6, 6, 1)
         return
 
     state = engine_adapter.get_link_state()
-    oled.text("ECU", 100, 0, 1)
 
     if state == LINK_OK:
-        oled.fill_rect(120, 1, 4, 4, 1)
+        oled.fill_rect(0, 32, 6, 6, 1)
     elif state == LINK_STALE:
-        oled.rect(120, 1, 4, 4, 1)
+        oled.rect(0, 32, 6, 6, 1)
     else:
         if (utime.ticks_ms() // 250) % 2 == 0:
-            oled.fill_rect(120, 1, 4, 4, 1)
+            oled.fill_rect(0, 32, 6, 6, 1)
         else:
-            oled.rect(120, 1, 4, 4, 1)
+            oled.rect(0, 32, 6, 6, 1)
 
 
 def draw_history_graph(channel):
@@ -1679,7 +1807,7 @@ def maybe_save_persistent_state():
         return
 
     # Avoid blocking writes while UI is actively interactive.
-    if menu_active or info_active or graph_active:
+    if menu_active or info_active or graph_active or flog_active:
         return
 
     # In telemetry mode, skip writes while parser is assembling a frame.
@@ -1763,7 +1891,9 @@ def get_button_event():
 
 
 def settings_count():
-    return 18
+    # 0..6 local, 7..13 ECU values (7=ECTH..13=EMTR), 14=TMAP, 15=ECMT,
+    # 16=RSET, 17=TRIP (read-only), 18=TCLR. Total 19.
+    return 19
 
 
 def reset_settings_to_defaults():
@@ -1772,6 +1902,7 @@ def reset_settings_to_defaults():
     global debug_overlay_enabled, demo_mode_enabled
     global ecu_teeth_per_rev, ecu_sync_tooth_index, ecu_tooth_min_us, ecu_tooth_max_us
     global ecu_safe_fire_delay_us, ecu_safe_dwell_us, ecu_adv_map_cd
+    global ecu_missing_tooth_ratio_x10
 
     rpm_debounce_us = RPM_DEBOUNCE_US
     rpm_pulses_per_rev = RPM_PULSES_PER_REV
@@ -1781,12 +1912,13 @@ def reset_settings_to_defaults():
     speed_multiplier = SPEED_MULTIPLIER
     debug_overlay_enabled = DEBUG_OVERLAY_DEFAULT
     demo_mode_enabled = DEMO_MODE_DEFAULT
-    ecu_teeth_per_rev = 90
+    ecu_teeth_per_rev = 21
     ecu_sync_tooth_index = 0
-    ecu_tooth_min_us = 50
-    ecu_tooth_max_us = 30000
+    ecu_tooth_min_us = 300
+    ecu_tooth_max_us = 8000
     ecu_safe_fire_delay_us = 2500
     ecu_safe_dwell_us = 1700
+    ecu_missing_tooth_ratio_x10 = 18
     ecu_adv_map_cd = build_default_adv_map_cd(ecu_adv_map_rpm)
 
 
@@ -1801,7 +1933,7 @@ def adjust_setting(index, delta):
     global rpm_debounce_us, rpm_pulses_per_rev
     global wheel_size_mm, speed_pulses_per_rev, rpm_bar_max, debug_overlay_enabled, demo_mode_enabled
     global ecu_teeth_per_rev, ecu_sync_tooth_index, ecu_tooth_min_us, ecu_tooth_max_us
-    global ecu_safe_fire_delay_us, ecu_safe_dwell_us
+    global ecu_safe_fire_delay_us, ecu_safe_dwell_us, ecu_missing_tooth_ratio_x10
 
     before = (
         rpm_debounce_us,
@@ -1817,6 +1949,7 @@ def adjust_setting(index, delta):
         ecu_tooth_max_us,
         ecu_safe_fire_delay_us,
         ecu_safe_dwell_us,
+        ecu_missing_tooth_ratio_x10,
     )
 
     if index == 0:
@@ -1863,6 +1996,10 @@ def adjust_setting(index, delta):
     elif index == 12:
         ecu_safe_dwell_us += delta * 50
         ecu_safe_dwell_us = clamp(ecu_safe_dwell_us, 800, 4000)
+    elif index == 13:
+        # EMTR step is 0.1 -> integer 1 in the *10 representation.
+        ecu_missing_tooth_ratio_x10 += delta
+        ecu_missing_tooth_ratio_x10 = clamp(ecu_missing_tooth_ratio_x10, 12, 30)
 
     after = (
         rpm_debounce_us,
@@ -1878,15 +2015,17 @@ def adjust_setting(index, delta):
         ecu_tooth_max_us,
         ecu_safe_fire_delay_us,
         ecu_safe_dwell_us,
+        ecu_missing_tooth_ratio_x10,
     )
     if after != before:
         settings_dirty = True
-        if index >= 7 and index <= 12:
+        if index >= 7 and index <= 13:
             ecu_cfg_dirty = True
 
 
 def handle_buttons():
     global menu_active, info_active, graph_active, map_editor_active
+    global flog_active, flog_index
     global graph_channel, graph_view_idx, graph_paused, map_point_index, menu_index
     global settings_dirty, ecu_cfg_dirty, reset_confirm_armed, trip_clear_confirm_armed, ecu_commit_confirm_armed
     global trip_dirty, odo_dirty, runtime_dirty
@@ -1925,7 +2064,7 @@ def handle_buttons():
                 ecu_cfg_dirty = True
         return
 
-    if not menu_active and not info_active and not graph_active:
+    if not menu_active and not info_active and not graph_active and not flog_active:
         if event == "OK":
             menu_active = True
             reset_confirm_armed = False
@@ -1952,19 +2091,42 @@ def handle_buttons():
                 graph_view_idx -= 1
         return
 
+    if flog_active:
+        # Navigation chain: info -> flog -> graph. LEFT past first entry
+        # backs up to info; RIGHT past last entry advances to graph. If the
+        # log is empty, RIGHT goes straight to graph.
+        entries, _ = engine_adapter.get_fault_log()
+        total = len(entries)
+        if event == "OK" or event == "OK_LONG":
+            flog_active = False
+        elif event == "RIGHT":
+            if total == 0 or flog_index >= total - 1:
+                flog_active = False
+                graph_active = True
+            else:
+                flog_index += 1
+        elif event == "LEFT":
+            if flog_index > 0:
+                flog_index -= 1
+            else:
+                flog_active = False
+                info_active = True
+        return
+
     if info_active:
         if event == "OK" or event == "OK_LONG":
             info_active = False
         elif event == "RIGHT":
             info_active = False
-            graph_active = True
-        return
-
-    if event == "OK" and menu_index == 13:
-        map_editor_active = True
+            flog_active = True
+            flog_index = 0
         return
 
     if event == "OK" and menu_index == 14:
+        map_editor_active = True
+        return
+
+    if event == "OK" and menu_index == 15:
         if not ecu_commit_confirm_armed:
             ecu_commit_confirm_armed = True
             ecu_cfg_last_status = "CFG arm commit"
@@ -1974,7 +2136,7 @@ def handle_buttons():
             ecu_commit_confirm_armed = False
         return
 
-    if event == "OK" and menu_index == 15:
+    if event == "OK" and menu_index == 16:
         if not reset_confirm_armed:
             reset_confirm_armed = True
         else:
@@ -1988,7 +2150,7 @@ def handle_buttons():
             reset_confirm_armed = False
         return
 
-    if event == "OK" and menu_index == 17:
+    if event == "OK" and menu_index == 18:
         if not trip_clear_confirm_armed:
             trip_clear_confirm_armed = True
         else:
@@ -2024,14 +2186,14 @@ def handle_buttons():
         ecu_commit_confirm_armed = False
         menu_index = (menu_index + 1) % settings_count()
     elif event == "LEFT":
-        if menu_index < 13:
+        if menu_index < 14:
             adjust_setting(menu_index, -1)
         else:
             reset_confirm_armed = False
             trip_clear_confirm_armed = False
             ecu_commit_confirm_armed = False
     elif event == "RIGHT":
-        if menu_index < 13:
+        if menu_index < 14:
             adjust_setting(menu_index, 1)
         else:
             reset_confirm_armed = False
@@ -2087,21 +2249,23 @@ def draw_settings_menu():
         elif idx == 12:
             label = "ESDW " + str(ecu_safe_dwell_us)
         elif idx == 13:
+            label = "EMTR " + str(ecu_missing_tooth_ratio_x10 // 10) + "." + str(ecu_missing_tooth_ratio_x10 % 10)
+        elif idx == 14:
             if ecu_cfg_dirty:
                 label = "TMAP edited"
             else:
                 label = "TMAP clean"
-        elif idx == 14:
+        elif idx == 15:
             if ecu_commit_confirm_armed:
                 label = "ECMT confirm?"
             else:
                 label = "ECMT " + ecu_cfg_last_status[-11:]
-        elif idx == 15:
+        elif idx == 16:
             if reset_confirm_armed:
                 label = "RSET confirm?"
             else:
                 label = "RSET defaults"
-        elif idx == 16:
+        elif idx == 17:
             label = "TRIP " + str(trip_mm // 1000000) + "." + str((trip_mm // 100000) % 10) + "km"
         else:
             if trip_clear_confirm_armed:
@@ -2114,19 +2278,19 @@ def draw_settings_menu():
 
     now = utime.ticks_ms()
     help_text = MENU_HELP_TEXT
-    if menu_index == 13:
+    if menu_index == 14:
         help_text = "TMAP: OK open  U/D point  L/R adv"
-    elif menu_index == 14:
+    elif menu_index == 15:
         if ecu_commit_confirm_armed:
             help_text = "ECMT: OK confirm  U/D cancel"
         else:
             help_text = "ECU cfg: OK arm commit"
-    elif menu_index == 15:
+    elif menu_index == 16:
         if reset_confirm_armed:
             help_text = MENU_HELP_RESET_CONFIRM
         else:
             help_text = MENU_HELP_RESET_ARM
-    elif menu_index == 17:
+    elif menu_index == 18:
         if trip_clear_confirm_armed:
             help_text = MENU_HELP_TCLR_CONFIRM
         else:
@@ -2171,6 +2335,42 @@ def draw_info_screen():
 
     oled.text("IG " + ign_txt + " " + sync_txt, 0, 38, 1)
     oled.text("FLT " + hex(faults & 0xFFFF), 0, 50, 1)
+
+
+def draw_fault_log_screen():
+    global flog_index
+
+    oled.fill(0)
+    entries, ecu_time_ms = engine_adapter.get_fault_log()
+    total = len(entries)
+
+    if total == 0:
+        oled.text("FLOG CLEAR", 24, 28, 1)
+        oled.text("L info  R graph", 0, 56, 1)
+        return
+
+    # Clamp index into range whenever the log shrinks (e.g. after an ECU
+    # reboot drops entries).
+    if flog_index >= total:
+        flog_index = total - 1
+    if flog_index < 0:
+        flog_index = 0
+
+    bit, rpm_at, tooth_at, _avg_at, ts_at, count = entries[flog_index]
+
+    oled.text("FLOG " + str(flog_index + 1) + "/" + str(total), 0, 0, 1)
+    oled.text(fault_short_name(bit), 0, 12, 1)
+    oled.text(fault_long_name(bit), 0, 22, 1)
+    oled.text("R" + str(rpm_at) + " TP" + str(tooth_at), 0, 34, 1)
+
+    age_ms = utime.ticks_diff(ecu_time_ms & 0xFFFFFFFF, ts_at & 0xFFFFFFFF)
+    if age_ms < 0:
+        age_ms = 0
+    age_s = age_ms // 1000
+    if age_s > 99999:
+        age_s = 99999
+    oled.text("N" + str(count) + " T-" + str(age_s) + "s", 0, 44, 1)
+    oled.text("L<-  R->  OK exit", 0, 56, 1)
 
 
 def draw_timing_map_editor():
@@ -2371,6 +2571,8 @@ def build_ecu_config_payload():
         "tmax": ecu_tooth_max_us,
         "sfd": ecu_safe_fire_delay_us,
         "sdw": ecu_safe_dwell_us,
+        # mtr is sent as a float; ECU sanitize_profile clamps to 1.2..3.0.
+        "mtr": ecu_missing_tooth_ratio_x10 / 10.0,
         "amc": ecu_adv_map_cd,
     }
 
@@ -2510,6 +2712,11 @@ def update_display():
         show_oled_safe()
         return
 
+    if flog_active:
+        draw_fault_log_screen()
+        show_oled_safe()
+        return
+
     if info_active:
         draw_info_screen()
         show_oled_safe()
@@ -2582,13 +2789,24 @@ def update_display():
         kmh_x = 128 - (len(KMH_TEXT) * 8)
     oled.text(KMH_TEXT, kmh_x, kmh_y, 1)
 
-    # Bottom-left: odometer
-    odo_base = format_odo_text(odo_mm)
-    odo_text = odo_base + " KM"
-    odo_text_w = len(odo_text) * 8
-    if odo_text_w >= (kmh_x - 8):
-        odo_text = odo_base
-    oled.text(odo_text, 0, TEMP_TEXT_Y, 1)
+    # Bottom-left: live commanded ignition advance. The dash recomputes the
+    # ECU's commanded advance locally by interpolating the cached advance
+    # map at the current RPM (no extra TLV on the wire). Odometer is still
+    # persisted (trip_mm/odo_mm) and shown on the info screen; it has just
+    # been moved off the main screen.
+    ign_mode = get_display_ignition_mode()
+    if ign_mode == IGN_MODE_INHIBIT:
+        adv_text = "INH*"
+    elif ign_mode == IGN_MODE_SAFE:
+        adv_text = "SAF*"
+    else:
+        rpm_for_adv = get_display_rpm()
+        if rpm_for_adv < 0:
+            adv_text = "--.-*"
+        else:
+            adv_cd = _interp_map(rpm_for_adv, ecu_adv_map_rpm, ecu_adv_map_cd)
+            adv_text = format_cd_text(adv_cd) + "*"
+    oled.text(adv_text, 0, TEMP_TEXT_Y, 1)
 
     # Bottom-right: temp from adapter
     temp_text = format_temp_text(temp_now)

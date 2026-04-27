@@ -46,6 +46,7 @@ TLV_TEMP_C_X10_I16 = const(7)         # optional (not produced by ECU control co
 TLV_ECU_CYCLE_ID_U32 = const(8)
 TLV_SPARK_COUNTER_U32 = const(9)
 TLV_IGNITION_OUTPUT_STATE_U8 = const(10)
+TLV_FAULT_LOG = const(11)
 
 TLV_CFG_MODE_U8 = const(1)
 TLV_CFG_JSON = const(2)
@@ -109,17 +110,23 @@ VALID_TEMP = const(1 << 6)
 CRANK_DEBOUNCE_US = const(40)
 SYNC_TIMEOUT_US = const(250000)  # no tooth edge timeout => UNSYNCED/INHIBIT
 
-# Defaults sized for Strategy B (multi-tooth ring-gear Hall, ~90 teeth/rev,
-# one tooth filed off as the missing-tooth sync feature). 90 is a placeholder
-# until tooth count is confirmed on the engine.
-# At 9500 RPM, normal tooth period at 90 teeth = 60e6/(9500*90) = 70 us, so
-# tooth_min must be < 70 us. At 50 RPM cranking the missing-tooth gap = ~26.7 ms.
-GEAR_DEFAULT_TEETH = const(90)
+# Defaults sized for Strategy B (multi-tooth ring-gear Hall on the dry-clutch
+# REDUCTION ring gear with one tooth filed off). The ring gear rotates slower
+# than the crank by the reduction ratio, so the effective teeth-per-crank-rev
+# is ring_gear_physical_teeth / reduction_ratio. Worked example: 84 physical
+# teeth with 4:1 reduction => teeth_per_rev = 21. Confirm the actual ratio on
+# engine arrival and update this constant + the active profile to match.
+# At 9500 RPM with teeth_per_rev = 21, normal tooth period = 60e6/(9500*21)
+# = ~301 us, so tooth_min_us must be < 301 us. At slow pedal cranking the
+# missing-tooth gap is detected directly by the missing_tooth_ratio path
+# below, so tooth_max_us only needs to bound NORMAL teeth.
+GEAR_DEFAULT_TEETH = const(21)
 GEAR_DEFAULT_SYNC_TOOTH = const(0)
-GEAR_DEFAULT_MIN_US = const(50)
-GEAR_DEFAULT_MAX_US = const(30000)
+GEAR_DEFAULT_MIN_US = const(300)
+GEAR_DEFAULT_MAX_US = const(8000)
 GEAR_DEFAULT_DEBOUNCE_US = const(40)
 GEAR_DEFAULT_LOCK_EDGES = const(8)
+GEAR_DEFAULT_MTR_X10 = const(18)
 GEAR_NOISE_STREAK_LIMIT = const(6)
 GEAR_RANGE_STREAK_LIMIT = const(4)
 
@@ -159,6 +166,9 @@ MAX_UNSCHED_STREAK_SAFE = const(6)
 MAX_SAFE_BOUNDS_FAIL = const(6)
 COUNTER_MASK = const(0x3FFFFFFF)
 
+# Fault log ring buffer
+FAULT_LOG_SIZE = const(8)
+
 # -----------------------------
 # Runtime globals
 # -----------------------------
@@ -174,6 +184,18 @@ sync_state = SYNC_LOST
 ignition_mode = IGN_MODE_INHIBIT
 fault_bits = 0
 validity_bits = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+
+# Structured fault log: parallel flat arrays so set_fault() never allocates
+# while running in hard-IRQ context. fault_log_used tracks how many slots
+# are populated (0..FAULT_LOG_SIZE). Repeat occurrences of the same
+# fault_bit increment count and refresh timestamp/context in place.
+fault_log_bits = [0] * FAULT_LOG_SIZE
+fault_log_rpm = [0] * FAULT_LOG_SIZE
+fault_log_tooth = [0] * FAULT_LOG_SIZE
+fault_log_avg = [0] * FAULT_LOG_SIZE
+fault_log_ts = [0] * FAULT_LOG_SIZE
+fault_log_count_arr = [0] * FAULT_LOG_SIZE
+fault_log_used = 0
 
 cycle_id = 0
 spark_counter = 0
@@ -370,8 +392,48 @@ def led_tick():
 
 
 def set_fault(bit):
-    global fault_bits
+    global fault_bits, fault_log_used
     fault_bits |= bit
+
+    # Capture context atomically. disable_irq is harmless when already in a
+    # hard-IRQ path (returns 0, restored by hardware on ISR exit) and
+    # protects the flat arrays against concurrent ISR/timer callers.
+    irq = disable_irq()
+    rpm_now = rpm_value
+    cur_dt = 0
+    cur_avg = 0
+    if crank_gear is not None:
+        cur_dt = crank_gear.last_dt_us
+        cur_avg = crank_gear.tooth_period_us
+    now_ms = utime.ticks_ms()
+
+    found = -1
+    i = 0
+    while i < fault_log_used:
+        if fault_log_bits[i] == bit:
+            found = i
+            break
+        i += 1
+
+    if found >= 0:
+        c = fault_log_count_arr[found] + 1
+        if c > 65535:
+            c = 65535
+        fault_log_count_arr[found] = c
+        fault_log_ts[found] = now_ms
+        fault_log_rpm[found] = rpm_now
+        fault_log_tooth[found] = cur_dt
+        fault_log_avg[found] = cur_avg
+    elif fault_log_used < FAULT_LOG_SIZE:
+        slot = fault_log_used
+        fault_log_bits[slot] = bit
+        fault_log_rpm[slot] = rpm_now
+        fault_log_tooth[slot] = cur_dt
+        fault_log_avg[slot] = cur_avg
+        fault_log_ts[slot] = now_ms
+        fault_log_count_arr[slot] = 1
+        fault_log_used = slot + 1
+    enable_irq(irq)
 
 
 def clear_fault(bit):
@@ -431,9 +493,22 @@ class CRANK_GEAR_LAYER:
         self.sync_edges_to_lock = int(profile.get("sync_edges_to_lock", GEAR_DEFAULT_LOCK_EDGES))
         if self.sync_edges_to_lock < 1:
             self.sync_edges_to_lock = 1
+        # Stored as ratio*10 so missing-tooth detection in on_edge stays in
+        # integer arithmetic for the hard-IRQ path.
+        try:
+            ratio = float(profile.get("missing_tooth_ratio", 1.8))
+        except (TypeError, ValueError):
+            ratio = 1.8
+        ratio_x10 = int(ratio * 10 + 0.5)
+        if ratio_x10 < 12:
+            ratio_x10 = 12
+        elif ratio_x10 > 30:
+            ratio_x10 = 30
+        self.missing_tooth_ratio_x10 = ratio_x10
 
     def reset(self):
         self.last_edge_us = 0
+        self.last_dt_us = 0
         self.tooth_period_us = 0
         self.rev_period_us = 0
         self.tooth_index = 0
@@ -478,6 +553,26 @@ class CRANK_GEAR_LAYER:
             return GEAR_EDGE_NONE
 
         self.last_edge_us = now_us
+        self.last_dt_us = dt_us
+
+        # Missing-tooth detection MUST run before the range check, otherwise
+        # the gap interval (which is naturally > tooth_max_us) accumulates
+        # range_streak and triggers GEAR_ERR_RANGE instead of providing the
+        # sync reference.
+        if self.tooth_period_us > 0 and (dt_us * 10) > (self.tooth_period_us * self.missing_tooth_ratio_x10):
+            self.noise_streak = 0
+            self.range_streak = 0
+            self._update_period(dt_us)
+            if self.sync_state == SYNC_LOST:
+                self.sync_state = SYNC_SYNCING
+            self.tooth_index = self.sync_tooth_index
+            self._update_angle()
+            if self.sync_state == SYNC_SYNCING:
+                self.sync_edge_count += 1
+                if self.sync_edge_count >= self.sync_edges_to_lock:
+                    self.sync_state = SYNC_SYNCED
+            self.last_error = GEAR_ERR_NONE
+            return GEAR_EDGE_REFERENCE
 
         if dt_us < self.tooth_min_us or dt_us > self.tooth_max_us:
             self.range_streak += 1
@@ -666,6 +761,7 @@ def _expand_cfg_aliases(cfg_obj):
         "tmax": "tooth_max_us",
         "sfd": "safe_fire_delay_us",
         "sdw": "safe_dwell_us",
+        "mtr": "missing_tooth_ratio",
         "amr": "advance_map_rpm",
         "amc": "advance_map_cd",
     }
@@ -1008,6 +1104,13 @@ def build_payload():
     cycle_now = cycle_id
     spark_now = spark_counter
     ign_out_now = coil_active
+    flog_used = fault_log_used
+    flog_bits_snap = list(fault_log_bits[:flog_used])
+    flog_rpm_snap = list(fault_log_rpm[:flog_used])
+    flog_tooth_snap = list(fault_log_tooth[:flog_used])
+    flog_avg_snap = list(fault_log_avg[:flog_used])
+    flog_ts_snap = list(fault_log_ts[:flog_used])
+    flog_count_snap = list(fault_log_count_arr[:flog_used])
     enable_irq(irq)
 
     payload = bytearray()
@@ -1021,6 +1124,17 @@ def build_payload():
     tlv_u32(payload, TLV_ECU_CYCLE_ID_U32, cycle_now)
     tlv_u32(payload, TLV_SPARK_COUNTER_U32, spark_now)
     tlv_u8(payload, TLV_IGNITION_OUTPUT_STATE_U8, ign_out_now)
+
+    if flog_used > 0:
+        flog_buf = bytearray()
+        for i in range(flog_used):
+            put_u32_le(flog_buf, flog_bits_snap[i] & 0xFFFFFFFF)
+            put_u16_le(flog_buf, flog_rpm_snap[i] & 0xFFFF)
+            put_u32_le(flog_buf, flog_tooth_snap[i] & 0xFFFFFFFF)
+            put_u32_le(flog_buf, flog_avg_snap[i] & 0xFFFFFFFF)
+            put_u32_le(flog_buf, flog_ts_snap[i] & 0xFFFFFFFF)
+            put_u16_le(flog_buf, flog_count_snap[i] & 0xFFFF)
+        tlv_bytes(payload, TLV_FAULT_LOG, flog_buf)
 
     # Optional fields are intentionally omitted by ECU core unless dedicated sensors are added.
     return payload

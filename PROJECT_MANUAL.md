@@ -1,6 +1,6 @@
 # Bike2 Project Manual (Living Document)
 
-Last updated: 2026-04-26
+Last updated: 2026-04-27
 
 This is the single-source reference for the current Bike2 project.
 
@@ -629,7 +629,7 @@ The hard architectural facts for this build:
 
 - **Stock CDI is removed entirely.** No OEM ignition behavior is preserved or assumed.
 - **Magneto remains physically installed.** It is repurposed as the ignition coil's primary supply, AC → bridge rectifier → smoothing → coil primary +. The magneto has zero role in ignition timing.
-- **Crank/gear sensor is the ONLY timing source.** A Hall effect sensor (Allegro A3144 with back-bias magnet, or equivalent back-biased Hall) is mounted **inside the dry clutch cover** and reads the outer ring gear teeth directly. **One tooth is filed off** to provide the missing-tooth sync feature. The estimated tooth count is 80-100 (must be confirmed by visual count when the engine is opened); 90 is used as a placeholder throughout this section.
+- **Crank/gear sensor is the ONLY timing source.** A Hall effect sensor (Allegro A3144 with back-bias magnet, or equivalent back-biased Hall) is mounted on the **back face of the clutch assembly** (sensor body inside the assembly, cable exits via a rubber grommet, sensor tip faces the ring gear teeth from the inner side). It reads the outer ring gear teeth as they pass. **One tooth is filed off** to provide the missing-tooth sync feature. The ring gear is a **REDUCTION gear** driven from the crank — it does NOT rotate at crank speed. The effective teeth per crank revolution is `teeth_per_rev = ring_gear_physical_teeth / reduction_ratio`. Worked-example placeholder used throughout this manual: **84 physical teeth with 4:1 reduction → `teeth_per_rev = 21`**. Both the physical tooth count AND the reduction ratio must be confirmed by direct measurement when the engine is opened.
 - **Ignition is TCI** (transistor-coil-ignition): IGBT switches the coil primary low-side, controlled by ECU GP15 through optical isolation. The existing ECU firmware is built natively for TCI semantics (dwell + fire events).
 - **Pico ECU is powered by Li-ion**, not by the magneto. The magneto only supplies the ignition coil. The ECU starts up before the engine cranks (battery-buffered).
 
@@ -637,8 +637,9 @@ Before wiring on the actual bike, the builder must measure these parameters on t
 
 | Parameter | Typical | How to measure | Used by |
 |---|---|---|---|
-| Ring gear tooth count (UN-filed) | 80-100 | Visual count after clutch cover removal | Sets `teeth_per_rev` (placeholder: 90) |
-| Crank-to-clutch ratio | 1:1 (most kit engines) | Mark and rotate by hand, count clutch turns per crank turn | Confirms one rev/rev assumption |
+| Ring gear physical tooth count (UN-filed) | 60-100 | Visual count after clutch cover removal | Numerator of `teeth_per_rev` calc (placeholder: 84) |
+| Crank-to-ring-gear reduction ratio | 3:1 to 5:1 | **Mark crank + ring gear, rotate crank by hand, count crank revolutions per ONE full ring gear revolution.** Ring gear is a reduction; it rotates slower than the crank. | Denominator of `teeth_per_rev` calc (placeholder: 4) |
+| Effective teeth per crank rev | 15-30 | physical_teeth / reduction_ratio | Sets `teeth_per_rev` directly (placeholder: 21 = 84 / 4) |
 | Filed-tooth angular position | aligned with TDC ± 1 tooth | Set with degree wheel before filing | Anchors `sync_tooth_index` to TDC |
 | TDC position on flywheel | n/a | Piston-stop tool + degree wheel | Mechanical reference for filing the sync tooth |
 | Magneto AC peak at 3000 RPM | 8-15 V | Isolated scope across magneto wires | Sizes rectifier and TVS |
@@ -646,11 +647,23 @@ Before wiring on the actual bike, the builder must measure these parameters on t
 | Idle RPM | 1500-2200 | Tachometer or Dash readout | Tuning baseline |
 | Peak RPM | 7000-9000 | Engine spec / observed | Sets `tooth_min_us` headroom |
 
+#### Reduction-Ratio Measurement Procedure (Engine Arrival)
+
+Do this BEFORE editing `teeth_per_rev` in the active profile.
+
+1. Remove the dry clutch cover. The ring gear and the crank-side drive gear are now both visible.
+2. Apply a paint mark on the crank-side gear at any tooth, and a paint mark on the ring gear at any tooth — does not matter which.
+3. Slowly rotate the crank by hand (kickstart, or a wrench on the crank nut). Count how many **full crank revolutions** are required for the ring gear to complete **exactly one full revolution** back to its starting orientation.
+4. Record this integer (or simple ratio — e.g., 3, 4, 4:1, 5:1). This is your `reduction_ratio`.
+5. Visually count the ring gear teeth (`physical_teeth`).
+6. Compute `teeth_per_rev = physical_teeth // reduction_ratio` and update the active ECU profile (Dash menu → ECTH or via the runtime config protocol). The old (un-filed) tooth count goes in — `teeth_per_rev` is the count seen by the sensor PER CRANK REVOLUTION, before the file modification.
+7. The default values shipped in `ecu/config_layer.py` (`teeth_per_rev=21`, `tooth_min_us=300`, `tooth_max_us=8000`) assume the worked example (84 teeth, 4:1). Adjust all three together if your measured ratio differs — see the "Sync Strategy" section below for the formulas.
+
 ### Architecture Delta vs Generic Hardware Section
 
 This 2-stroke build differs from the generic Hardware Design section in five concrete ways:
 
-1. **Crank sensor is mounted internally inside the dry clutch cover**, reading the outer ring gear teeth directly. One tooth on the ring gear is filed off to create the missing-tooth sync feature. The sensor is independent of the magneto and is the sole timing source. There is no magnet target on the gear or clutch face.
+1. **Crank sensor is mounted on the back face of the clutch assembly**, with the sensor body sitting inside the assembly and the tip facing the ring gear teeth from the inner side. The sensor does NOT protrude externally; the cable exits through a rubber grommet. One tooth on the (reduction) ring gear is filed off to create the missing-tooth sync feature. The sensor is independent of the magneto and is the sole timing source. There is no magnet target on the gear or clutch face. Because the ring gear is a reduction (slower than the crank), the firmware's `teeth_per_rev` is `physical_teeth / reduction_ratio`, not the raw physical tooth count.
 2. **The magneto powers the ignition coil only.** Magneto AC → bridge rectifier → smoothing cap → TVS clamp → coil primary +. No copper from the magneto reaches the Pico.
 3. **Ignition driver is TCI** (IGBT, dwell-then-fire), not CDI. This matches the existing ECU firmware natively.
 4. **Pico is powered by Li-ion 1S** as in the generic design. The magneto is not a logic-power source.
@@ -684,7 +697,9 @@ Coil compatibility: most aftermarket motorcycle coils are happy with 6-30 V on t
 
 ### Crank Sensor (Internal, Reading Ring Gear Teeth)
 
-A Hall effect sensor mounted **inside** the dry clutch cover, with its tip facing the outer ring gear, is the ONLY timing reference. Wiring goes directly to ECU GP2 via a simple conditioner.
+A Hall effect sensor mounted on the **back face of the clutch assembly**, with its tip facing the inner side of the outer ring gear, is the ONLY timing reference. The sensor body sits inside the clutch assembly so nothing protrudes externally; the cable exits the engine case through a rubber grommet. Wiring goes directly to ECU GP2 via a simple conditioner.
+
+Note on geometry: the ring gear is a **reduction** gear, driven from the crank at a 3:1 to 5:1 reduction (typical kit-engine range). It does not rotate at crank speed. The firmware reads ALL of its teeth as they pass, but the configured `teeth_per_rev` must be `physical_teeth / reduction_ratio` because that is the number of edges per crank revolution. With one tooth filed, `teeth_per_rev - 1` actual edges occur per crank rev plus the long missing-tooth gap.
 
 Sensor selection: **Allegro A3144** (with a small back-bias magnet bonded behind the package), or **Honeywell 1GT101DC** (back-biased Hall with the magnet built into the body). The A3144 is a unipolar Hall switch and on its own cannot detect a passing iron tooth — a back-bias magnet behind the IC creates a steady flux that each ferrous tooth modulates as it passes, switching the output. The 1GT101DC has the back-bias built-in and is mechanically simpler if you can source it. Both are 3-wire (V+, GND, signal), open-collector / push-pull at 3.3 V, and work at 0.5-2.0 mm air gap. Insensitive to oil mist.
 
@@ -730,59 +745,66 @@ Behavior: the ECU GP15 goes HIGH to start the dwell phase (current builds throug
 
 Recommended IGBT: **FGA25N120ANTD** (1200 V, 25 A, internal flyback diode, automotive grade). Cheaper alternative: BU941ZP Darlington. Mount with a thermal pad to a small heatsink — at 50 fires/sec under sustained dwell, dissipation is modest but still nonzero.
 
-### Sync Strategy (Strategy B: Missing-Tooth Ring Gear)
+### Sync Strategy (Strategy B: Missing-Tooth Reduction Ring Gear)
 
-The chosen and only strategy for this build is **Strategy B — missing tooth on the dry-clutch outer ring gear**. The Hall sensor mounted inside the clutch cover reads each iron tooth as it passes; one tooth is filed off so the firmware can detect the long gap and anchor crank position to it. There is no magnet on the gear and no separate trigger wheel.
+The chosen and only strategy for this build is **Strategy B — missing tooth on the dry-clutch reduction ring gear**. The Hall sensor mounted on the back face of the clutch assembly reads each iron tooth as it passes; one tooth is filed off so the firmware can detect the long gap and anchor crank position to it. There is no magnet on the gear and no separate trigger wheel.
 
 How it works:
-- The ring gear has N teeth originally (estimated 80-100; placeholder N = 90 throughout this manual until confirmed on engine arrival).
-- After modification, N-1 teeth remain. The missing tooth is filed at an angular position that puts its leading edge at (or close to) crank TDC, so that the FIRST edge after the gap is the sync reference.
-- At every crankshaft revolution, the sensor produces N-1 rising edges, with one ~2× normal interval where the gap passes the sensor.
-- The ECU firmware uses `teeth_per_rev` and `sync_tooth_index` to count edges modulo a full revolution and emits one `GEAR_EDGE_REFERENCE` per rev when `tooth_index == sync_tooth_index`. That reference edge anchors the precision-mode fire-delay calculation.
+- The ring gear has `physical_teeth` teeth originally and is driven from the crank through a `reduction_ratio` (typical 3:1 to 5:1 for kit engines). The effective edges per CRANK revolution is `teeth_per_rev = physical_teeth / reduction_ratio`. Worked example: 84 physical teeth × 4:1 reduction → `teeth_per_rev = 21`.
+- After modification, `teeth_per_rev - 1` edges occur per crank rev, with one ~`missing_tooth_ratio`× longer interval where the filed gap passes the sensor.
+- The missing tooth is filed at an angular position that puts its leading edge at (or close to) crank TDC, so that the FIRST edge after the gap is the sync reference.
+- The ECU firmware now detects the long-gap interval directly. In `CRANK_GEAR_LAYER.on_edge`, AFTER the debounce check and BEFORE the range check, it tests `dt_us > tooth_period_us × missing_tooth_ratio`. If that condition is true and a stable `tooth_period_us` has been established, the firmware resets `tooth_index = sync_tooth_index`, updates the EMA period, and returns `GEAR_EDGE_REFERENCE`. This makes the reference edge pin directly to the gap on every revolution rather than walking around the gear modulo N.
 
 ECU config (place these via Dash settings or the runtime config protocol):
-- `teeth_per_rev = N` — the ORIGINAL tooth count, NOT N-1. Default placeholder: 90.
-- `sync_tooth_index = 0` — the index assigned to the first edge after the gap. (You can choose any index 0..N-1; 0 keeps the math obvious.)
+- `teeth_per_rev = physical_teeth / reduction_ratio` — the EFFECTIVE per-crank-rev tooth count, with the un-filed physical count in the numerator. Default placeholder: 21.
+- `sync_tooth_index = 0` — the index assigned to the first edge after the gap. (You can choose any index 0..teeth_per_rev-1; 0 keeps the math obvious.)
 - `sync_edges_to_lock = 8` — wait this many consistent edges before declaring SYNCED.
-- `tooth_min_us = 50` — must be < normal tooth period at redline. At N=90 and 9500 RPM the normal period is 70 us, so 50 leaves margin for measurement jitter.
-- `tooth_max_us = 30000` — must be > the missing-tooth gap at the lowest cranking speed you expect. At N=90 and 50 RPM cranking the gap is ~26.7 ms, so 30000 us covers it.
+- `tooth_min_us = 300` — must be < normal tooth period at redline. At 21 teeth/crank-rev and 9500 RPM the normal period is `60_000_000 / (9500 × 21) ≈ 301 µs`, so 300 leaves a hair of margin (re-tune to ~250 if measurement jitter approaches 300).
+- `tooth_max_us = 8000` — bounds NORMAL teeth only. The missing-tooth gap is captured by the new `missing_tooth_ratio` path BEFORE the range check, so this no longer needs to cover the gap. 8000 µs at 21 teeth corresponds to a normal tooth at ~340 RPM crank — generous enough for vigorous pedal cranking.
+- `missing_tooth_ratio = 1.8` — multiplier applied to the running EMA tooth period. The first edge whose `dt_us` exceeds `tooth_period_us × 1.8` is taken as the post-gap reference. Range 1.2..3.0; clamp the lower end if your gear is uniform enough that 1.5 still resolves cleanly, raise it if normal teeth occasionally jitter. Adjustable from the Dash menu under EMTR.
 - `debounce_us = 40` — rejects sub-edge ringing without losing real teeth.
 
-Pros (vs. the alternatives below): high angular resolution (~4° per tooth at N=90), full programmable advance, no magnet hardware, sensor is fully enclosed inside the clutch cover and protected from the engine bay.
+Sanity formulas (check these whenever you change `teeth_per_rev`):
+```
+tooth_min_us  <  60_000_000 / (peak_RPM × teeth_per_rev)
+tooth_max_us  >  60_000_000 / (min_normal_cranking_RPM × teeth_per_rev)
+missing_tooth_ratio  >  1.2          (else normal tooth jitter trips it)
+missing_tooth_ratio  <  2.0          (else a real gap might not exceed it)
+```
 
-Cons: irreversible gear modification, requires a degree wheel for filing alignment, and the firmware's edge-counting sync assumes the gap is detected as the first valid edge after a long-period interval (see "Firmware Limitation" below).
+Pros (vs. the alternatives below): high angular resolution (~17° per tooth at `teeth_per_rev = 21` — coarser than the original 90-tooth assumption but still sufficient for 2-stroke timing), full programmable advance, no magnet hardware, sensor is fully enclosed inside the clutch assembly and protected from the engine bay.
 
-#### Firmware Limitation — Read Before First Engine Run
+Cons: irreversible gear modification, requires a degree wheel for filing alignment.
 
-The current `CRANK_GEAR_LAYER` in `ecu/main.py` counts edges modulo `teeth_per_rev` and emits a reference whenever `tooth_index == sync_tooth_index`. With a perfectly uniform gear of N teeth and `teeth_per_rev = N`, this works. With one tooth filed off (N-1 actual edges per rev) and `teeth_per_rev = N`, the modulo wrap drifts by one tooth per revolution and the reference index walks around the gear instead of pinning to the gap.
+#### Firmware Status — Missing-Tooth Detection
 
-To make Strategy B function as described, the gear layer needs to detect the long gap (`dt_us > 1.5 × tooth_period_us`, say) and reset `tooth_index = 0` on the next valid edge. This logic is **not yet implemented** — adding it is a small, contained change to `CRANK_GEAR_LAYER.on_edge`, but it is intentionally out of scope for the current revision. Until it is added, do not trust `IGN_MODE_PRECISION` to time the spark correctly. Bench-validate sync behavior with a signal generator that simulates the missing tooth before connecting any coil load.
+The earlier limitation note ("gear layer cannot anchor `sync_tooth_index` to the gap") is **resolved**. `CRANK_GEAR_LAYER.on_edge` now performs explicit gap detection using `missing_tooth_ratio` before the range check. Bench-validate sync behaviour with a multi-tooth target (or a signal generator simulating the gap) before connecting any coil load — the procedure is unchanged, but the ECU should now reach SYNCED instead of flickering.
 
 #### Footnotes — Alternative Strategies (NOT used in this build)
 
 These are recorded only as reference for future builds. They are not the chosen path.
 
-- **Strategy A (single magnet, 1 pulse/rev).** Glue one neodymium magnet to the clutch face. Hall sees one pulse per revolution. ECU config: `teeth_per_rev = 1`, `tooth_min_us = 1500`, `tooth_max_us = 60000`. Lower resolution; useful for first-light bring-up but not chosen here.
-- **Strategy C (separate 36-1 trigger wheel).** Bolt a fabricated 36-1 wheel to the flywheel and read it with an external Hall. Equivalent firmware setup to Strategy B but adds a flywheel modification and external sensor mount. Not chosen because the existing dry-clutch ring gear is already accessible inside the clutch cover.
+- **Strategy A (single magnet, 1 pulse/rev).** Glue one neodymium magnet to the clutch face. Hall sees one pulse per revolution. ECU config: `teeth_per_rev = 1`, `tooth_min_us = 1500`, `tooth_max_us = 60000`, `missing_tooth_ratio = 3.0` (effectively disables gap detection). Lower resolution; useful for first-light bring-up but not chosen here.
+- **Strategy C (separate 36-1 trigger wheel).** Bolt a fabricated 36-1 wheel to the flywheel and read it with an external Hall. Equivalent firmware setup to Strategy B but adds a flywheel modification and external sensor mount. Not chosen because the existing dry-clutch reduction ring gear is already accessible inside the clutch cover.
 
-### Mechanical Mounting (Inside the Dry Clutch Cover)
+### Mechanical Mounting (Back Face of the Clutch Assembly)
 
-The crank/gear sensor is a back-biased Hall effect sensor mounted **inside** the dry clutch cover (between the cover wall and the outer ring gear). It reads the gear teeth as they pass. The OEM CDI is removed entirely; the magneto leads are repurposed for coil power supply only.
+The crank/gear sensor is a back-biased Hall effect sensor mounted on the **back face of the clutch assembly**, NOT through the outer clutch cover. The sensor body sits inside the assembly so it does not protrude externally; only the cable exits, via a rubber grommet through the case wall. The sensor tip faces the inner side of the outer ring gear and reads the gear teeth as they pass. The OEM CDI is removed entirely; the magneto leads are repurposed for coil power supply only.
 
-**Clutch cover modification procedure:**
+**Clutch assembly modification procedure:**
 
-1. Remove the clutch cover. Note original gasket condition and order a replacement.
-2. Confirm the clutch gear rotates at crankshaft speed: mark a tooth, rotate the kickstart by hand one full crank revolution, verify the marked tooth returns to the same position. Most Avenger-class kit engines are 1:1.
-3. Count the ring gear teeth and record `N` in the build log. Update `teeth_per_rev` in the ECU config to match the as-counted N.
-4. Pick a sensor mounting location on the inside of the cover:
-   - Sensor tip faces the OD of the ring gear with 0.5-1.5 mm air gap when the cover is bolted up.
-   - Mounting boss is in the upper half of the cover where it stays clear of the oil pool (the dry clutch is unlubricated, but residual oil fog accumulates at the bottom).
-   - Sensor body and cable do not foul any rotating part — verify clearance with the cover off but the clutch fully assembled by rotating slowly.
-5. Drill and tap the cover for the chosen sensor body. For the A3144 (TO-92 epoxy package, no native mount):
+1. Remove the clutch cover and access the clutch assembly's back face. Note original gasket condition and order a replacement cover gasket.
+2. Measure the crank-to-ring-gear reduction ratio per the procedure in the "Reduction-Ratio Measurement Procedure" section above. Mark crank + ring gear, rotate the crank by hand, count crank revolutions per one full ring gear revolution. Record both `physical_teeth` (count of ring gear teeth) and `reduction_ratio` in the build log. Update `teeth_per_rev = physical_teeth / reduction_ratio` in the ECU config.
+3. Pick a sensor mounting location on the back face of the clutch assembly (inner side):
+   - Sensor tip faces the inner OD of the ring gear with 0.5-1.5 mm air gap when the assembly is fully installed.
+   - Mounting bracket and sensor body sit ENTIRELY inside the assembly — nothing protrudes externally. Cable runs along the inside, exits the engine case through a rubber grommet (M8 or M10 cable gland with rubber bushing).
+   - Mounting boss is in the upper half of the assembly where it stays clear of the oil pool (the dry clutch is unlubricated, but residual oil fog accumulates at the bottom).
+   - Sensor body and cable do not foul any rotating part — verify clearance with the assembly off but the clutch fully assembled by rotating slowly.
+4. Drill and tap the back face of the clutch assembly for the chosen sensor body. For the A3144 (TO-92 epoxy package, no native mount):
    - Build a small aluminium L-bracket; bond the A3144 plus its back-bias magnet to one face with thermally-conductive epoxy (the magnet sits BEHIND the IC body, not on the gear side).
-   - Bolt the bracket to the inside of the cover with two M3 screws and thread-locker.
+   - Bolt the bracket to the back face of the assembly with two M3 screws and thread-locker.
    - For 1GT101DC (M5/M8 threaded body), drill a stepped hole and lock with two M-nuts for fine air-gap adjustment.
-6. Sensor cable exits the cover through a strain-relieved cable gland in the upper face, flexible loop to the harness, then a Deutsch DT04-3P connector to the ECU enclosure.
+5. Sensor cable runs along the inside of the assembly, exits the engine case through a rubber grommet in the case wall, flexible loop to the harness, then a Deutsch DT04-3P connector to the ECU enclosure. The grommet is the strain relief.
 
 **Filing the sync tooth (the missing tooth):**
 
@@ -809,7 +831,7 @@ This is the irreversible step. Do it carefully and align with TDC.
 1. Wire a timing strobe to the spark plug lead.
 2. Start the engine on a known-conservative advance map (e.g., 5° BTDC fixed across the RPM range).
 3. Aim the strobe at the flywheel TDC mark.
-4. The mark should appear ~5° before the case-side timing mark. If it appears at TDC or after, your filed-tooth alignment is off by one tooth — you must either re-zero `sync_tooth_index` (one tooth = 360°/N ≈ 4° at N=90, software-correctable) or re-mark and re-file (irreversible).
+4. The mark should appear ~5° before the case-side timing mark. If it appears at TDC or after, your filed-tooth alignment is off by one tooth — you must either re-zero `sync_tooth_index` (one tooth = 360°/teeth_per_rev ≈ 17° at `teeth_per_rev = 21`, software-correctable) or re-mark and re-file (irreversible). Note: with the lower angular resolution of a reduction-gear setup, a one-tooth offset is more visible on the strobe than it was for the previous 90-tooth assumption — but the correction step is the same.
 
 Magneto wiring (power only): the existing 2 magneto leads emerge from the engine case. Both go to the ECU enclosure as a silicone-jacketed twisted pair (no shielding strictly needed since they only carry rectifier input, not signal). At the ECU enclosure they enter the bridge rectifier inputs. The OEM CDI is binned.
 
@@ -873,13 +895,13 @@ Wire the switch as a 4-wire harness:
 
 ### Timing and Control Model (2-Stroke Specific)
 
-The ECU firmware already implements the timing path. With Strategy B (multi-tooth ring gear, one tooth filed off), the gear layer counts every tooth edge to maintain crank position, but only emits ONE `GEAR_EDGE_REFERENCE` per crankshaft revolution — the edge whose `tooth_index` equals `sync_tooth_index`. That one reference per rev anchors the fire-delay calculation:
+The ECU firmware already implements the timing path. With Strategy B (multi-tooth reduction ring gear, one tooth filed off), the gear layer counts every tooth edge to maintain crank position. It emits one `GEAR_EDGE_REFERENCE` per crankshaft revolution — either when the explicit gap-detection path fires (long-period interval after the missing tooth), or when the modulo edge counter rolls over to `sync_tooth_index`. That one reference per rev anchors the fire-delay calculation:
 
 ```
 fire_delay_us = rev_period_us - (rev_period_us × advance_cd / 36000)
 ```
 
-where `rev_period_us` is the measured full crankshaft period (`tooth_period_us × teeth_per_rev`), and `advance_cd` is the desired advance in centidegrees from the lookup map. This is the formula in `arm_precision_from_edge` ([ecu/main.py:810](ecu/main.py#L810)).
+where `rev_period_us` is the measured full crankshaft period (`tooth_period_us × teeth_per_rev`), and `advance_cd` is the desired advance in centidegrees from the lookup map. This is the formula in `arm_precision_from_edge` ([ecu/main.py](ecu/main.py)).
 
 For TCI, the firmware also schedules the **dwell** event ahead of the fire:
 
@@ -889,13 +911,13 @@ on_time  = fire_time - dwell_us
 
 `dwell_us` is interpolated from `dwell_map_rpm` / `dwell_map_us`. At low RPM (long period) the firmware caps dwell to avoid coil overheating; at high RPM it ensures enough flux builds before the fire event.
 
-Note on the formula's TDC anchor: with `sync_tooth_index` aligned so the reference edge fires AT TDC, `advance_cd` is the actual ° BTDC at which the spark fires. The formula computes "fire `advance` degrees before the NEXT reference edge", which is the same as "fire `advance` degrees BTDC of the next TDC". If the reference edge is offset from TDC (e.g., one tooth early due to filing alignment error), the offset propagates as a constant additive bias to all advance numbers — correctable by adjusting `sync_tooth_index` by ±1 (one tooth ≈ 4° at N = 90).
+Note on the formula's TDC anchor: with `sync_tooth_index` aligned so the reference edge fires AT TDC, `advance_cd` is the actual ° BTDC at which the spark fires. The formula computes "fire `advance` degrees before the NEXT reference edge", which is the same as "fire `advance` degrees BTDC of the next TDC". If the reference edge is offset from TDC (e.g., one tooth early due to filing alignment error), the offset propagates as a constant additive bias to all advance numbers — correctable by adjusting `sync_tooth_index` by ±1 (one tooth ≈ 17° at `teeth_per_rev = 21`).
 
-Worked example (Strategy B, N = 90 teeth, sync tooth aligned to TDC, target advance 15° BTDC, 6000 RPM):
+Worked example (Strategy B, `teeth_per_rev = 21` from 84 physical teeth × 4:1 reduction, sync tooth aligned to TDC, target advance 15° BTDC, 6000 RPM):
 
 ```
-rev_period_us = 60_000_000 / 6000               = 10_000 µs (one full crank rev)
-tooth_period_us = rev_period_us / 90            ≈ 111 µs (per-tooth interval)
+rev_period_us   = 60_000_000 / 6000             = 10_000 µs (one full crank rev)
+tooth_period_us = rev_period_us / 21            ≈ 476 µs (per-tooth interval)
 advance_cd      = 15° × 100                     = 1500
 fire_delay_us   = 10_000 - (10_000 × 1500 / 36000)
                 = 10_000 - 416                  = 9_584 µs
@@ -903,15 +925,15 @@ fire_delay_us   = 10_000 - (10_000 × 1500 / 36000)
 
 So at the reference edge (TDC), the firmware schedules fire 9 584 µs later — i.e., 416 µs before the NEXT reference edge — which is exactly 15° before the next TDC, i.e., 15° BTDC. The dwell event is scheduled `dwell_us` earlier than the fire.
 
-At 9000 RPM with the same advance and N = 90:
+At 9500 RPM with the same advance and `teeth_per_rev = 21`:
 ```
-rev_period_us   = 60_000_000 / 9000             ≈ 6_666 µs
-tooth_period_us ≈ 74 µs
-fire_delay_us   = 6_666 - (6_666 × 1500 / 36000)
-                ≈ 6_666 - 277                   ≈ 6_389 µs
+rev_period_us   = 60_000_000 / 9500             ≈ 6_316 µs
+tooth_period_us ≈ 301 µs
+fire_delay_us   = 6_316 - (6_316 × 1500 / 36000)
+                ≈ 6_316 - 263                   ≈ 6_053 µs
 ```
 
-Per-tooth ISR throughput at 9000 RPM × 90 teeth = 13 500 edges/sec, one edge every ~74 µs. The firmware's `ISR_OVERRUN_LIMIT_US = 100` constant allows the per-tooth state update plus the per-rev reference path (which adds two `_interp_map` calls and a `schedule_cycle_events` call) to complete without spuriously raising `FAULT_ISR_OVERRUN`. If you see ISR-overrun faults at high RPM, the first tuning lever is reducing the size of `advance_map_*` and `dwell_map_*` (fewer break points → faster `_interp_map`).
+Per-tooth ISR throughput at 9500 RPM × 21 = 3 325 edges/sec, one edge every ~301 µs — much lower than the previous 90-tooth assumption (~74 µs/edge), so the per-tooth ISR has comfortable headroom under `ISR_OVERRUN_LIMIT_US = 100`. The advance-map size is no longer ISR-throughput-limited at this geometry; the same defaults are kept for compatibility.
 
 Critical rule for 2-stroke timing:
 - Advance angle MUST decrease (retard) past peak power RPM. Over-advance at high RPM detonates the 2-stroke and destroys it. A typical curve for a kit 85cc:
@@ -958,8 +980,8 @@ Follow stages in order. Do not skip ahead.
 - Power the sensor from ECU 3V3.
 - Wave a small steel screwdriver across the sensor tip — output should pulse cleanly. Scope the conditioner output: rectangular 0/3.3 V transitions, no chatter.
 - Connect to ECU GP2.
-- Strategy B exercise (recommended bench step before the engine arrives): build a small turntable or use a stepper-driven shaft with a fabricated multi-tooth target plate (e.g., a 3D-printed disc with N=90 ferrous inserts and one missing). Spin it at a known RPM. Set `teeth_per_rev = 90`, `sync_tooth_index = 0`. Confirm Dash shows the expected RPM and sync advances LOST → SYNCING → SYNCED.
-- Quick smoke test if no multi-tooth fixture is available: temporarily set `teeth_per_rev = 1` and pulse one steel target past the sensor by hand at ~1 Hz; Dash should show ~60 RPM. **Revert `teeth_per_rev` back to 90 before continuing** — the rest of the build assumes Strategy B.
+- Strategy B exercise (recommended bench step before the engine arrives): build a small turntable or use a stepper-driven shaft with a fabricated multi-tooth target plate (e.g., a 3D-printed disc with 21 ferrous inserts and one missing — match whatever `teeth_per_rev` you intend to ship). Spin it at a known RPM. Set `teeth_per_rev` to match, `sync_tooth_index = 0`, `missing_tooth_ratio = 1.8`. Confirm Dash shows the expected RPM and sync advances LOST → SYNCING → SYNCED. Confirm the Dash main screen "ADV XX.XXd" tracks the configured advance map at the spinning RPM.
+- Quick smoke test if no multi-tooth fixture is available: temporarily set `teeth_per_rev = 1`, `missing_tooth_ratio = 3.0` (effectively disable gap detection), and pulse one steel target past the sensor by hand at ~1 Hz; Dash should show ~60 RPM. **Revert `teeth_per_rev` and `missing_tooth_ratio` back to the engine values before continuing** — the rest of the build assumes Strategy B.
 
 **Stage 4 — Magneto-rectifier bench substitution.**
 - Build the bridge rectifier + bulk cap + TVS.
@@ -985,22 +1007,37 @@ Follow stages in order. Do not skip ahead.
 - Use a timing strobe simultaneously to verify the spark angle relative to a marker on a turning stub shaft (or trust the ECU's commanded delay if you don't have a strobe yet).
 
 **Stage 7 — Mount on engine, magneto power, NO COIL FIRE.**
-- Open the clutch cover and count the ring gear teeth. Update `teeth_per_rev` in the ECU config to match the as-counted N.
+- Open the clutch cover and **measure the reduction ratio** per the procedure in "Reduction-Ratio Measurement Procedure" — mark the crank, mark a tooth on the ring gear, rotate the crank by hand, count crank revs per one ring gear rev. Record `physical_teeth` and `reduction_ratio` in the build log. Update `teeth_per_rev = physical_teeth / reduction_ratio` in the ECU config.
 - File the chosen sync tooth flat as described in "Mechanical Mounting". Deburr and clean thoroughly.
-- Install the Hall sensor (A3144 with back-bias, or 1GT101DC) inside the clutch cover; verify air gap 0.5-1.5 mm at every tooth and at the gap.
+- Install the Hall sensor (A3144 with back-bias, or 1GT101DC) on the **back face of the clutch assembly** (sensor body inside, cable exits via grommet); verify air gap 0.5-1.5 mm at every tooth and at the gap.
 - Reassemble the clutch cover with a fresh gasket.
 - Connect magneto AC leads to the bridge rectifier input.
 - KILL SWITCH ACTIVE (opto LED open).
-- Pull recoil or push the bike in gear by hand. Sensor should pulse N-1 times per crank revolution with one wider gap. Dash shows RPM advancing LOST → SYNCING → SYNCED.
-  - **If sync never reaches SYNCED, or sync flickers**, this is the Strategy B firmware limitation flagged earlier — the gear layer cannot anchor `sync_tooth_index` to the gap without explicit gap-detection logic. Stop here, verify the limitation note in "Sync Strategy", and do not proceed until the gear layer has been updated to detect the long-period interval and reset `tooth_index`.
+- Pull recoil or push the bike in gear by hand. Sensor should pulse `teeth_per_rev - 1` times per crank revolution with one wider gap. **Watch the ECU onboard LED** (GP25): slow blink = SYNC_LOST, fast blink = SYNC_SYNCING, solid = SYNC_SYNCED. Dash also shows RPM advancing LOST → SYNCING → SYNCED.
+  - If sync never reaches SYNCED or flickers, open the FLOG screen on the Dash (OK_LONG → RIGHT). The structured fault log gives the specific bit (e.g. `EDGE BAD`, `SYNC UNSTABLE`), the RPM and tooth period at the moment the fault was raised, and an occurrence counter — much more diagnostic than the old hex bitmap.
 - Verify rectifier output rises with cranking speed (scope or DMM).
 - Confirm NO spark on the plug despite the trigger pulses (kill switch isolates).
 
 **Stage 8 — First spark on engine (NO FUEL).**
+
+This is **pedal-start** territory: the rider pedals the bike (or pulls recoil) for several crank revolutions before the clutch dumps and the engine actually fires. SYNC_SYNCING and IGN_MODE_SAFE firing during the initial acquisition window is **expected and normal** — the firmware needs `sync_edges_to_lock` consistent edges before it will declare SYNC_SYNCED. The rider's job is to watch the **ECU onboard LED** (GP25, visible through a small light pipe / clear epoxy window in the ECU enclosure) during pedal-up and wait for solid-on before dumping the clutch:
+
+| LED state | Sync state | What to do |
+|---|---|---|
+| Slow blink (~600 ms period) | SYNC_LOST | Keep pedaling; sensor not yet seeing teeth |
+| Fast blink (~220 ms period) | SYNC_SYNCING | Sensor is seeing teeth but firmware has not locked yet — keep pedaling |
+| Solid on | SYNC_SYNCED | Lock acquired — dump the clutch now for best first-start behaviour |
+
+The engine WILL also catch in IGN_MODE_SAFE if the clutch is dumped during SYNCING (the ECU runs a fixed `safe_fire_delay_us` from each reference edge until precision lock is reached). Waiting for SYNCED gives a cleaner first ignition because precision-mode timing is map-driven instead of fixed.
+
+The ECU LED is the **primary** sync status indicator during pedal-up — the rider does not need to look at the Dash to know when to dump the clutch. The Dash mirrors the same state in its top-left "SY" badge but the LED is faster to glance at and works even if the OLED is off.
+
+Procedure:
+
 - Plug installed in cylinder, spark plug wire connected. Fuel tap OFF.
 - Set advance map to ONE conservative point: 5° BTDC at 1500 RPM, INHIBIT above 2500 RPM.
-- Release kill switch. Pull recoil briskly. You should hear/see spark inside the cylinder.
-- **Verify spark angle with a timing strobe** (critical — this is the sync-alignment check). Strobe should freeze the flywheel TDC mark at ~5° before the case-side mark. If the offset is wrong by an integer multiple of 360°/N (≈ 4° at N=90), adjust `sync_tooth_index` by ±1 via Dash settings and retest. If the offset is non-integer or unstable, the gap detection is failing — stop and debug the gear layer.
+- Release kill switch. Pedal up (or pull recoil briskly). Watch the ECU LED progress: slow blink → fast blink → solid. Dump the clutch on solid. You should hear/see spark inside the cylinder.
+- **Verify spark angle with a timing strobe** (critical — this is the sync-alignment check). Strobe should freeze the flywheel TDC mark at ~5° before the case-side mark. If the offset is wrong by an integer multiple of `360°/teeth_per_rev` (≈ 17° at `teeth_per_rev = 21`), adjust `sync_tooth_index` by ±1 via Dash settings and retest. If the offset is non-integer or unstable, the missing-tooth detection is misfiring — stop, raise `missing_tooth_ratio` (Dash → EMTR) one notch, and retry. Cross-check the FLOG screen for any `EDGE BAD` or `SYNC UNSTABLE` entries.
 - Reapply kill switch, leave for next stage.
 
 **Stage 9 — Idle on fuel.**
@@ -1064,15 +1101,18 @@ Ignition isolation:
 - [ ] Gate has 10 kΩ pull-down to emitter (gate fail-safe)
 
 Sensor reliability:
-- [ ] Ring gear tooth count verified by visual count and recorded in build log; `teeth_per_rev` in active profile matches as-counted N (NOT N-1)
+- [ ] Reduction ratio measured directly (mark + count crank revs per ring gear rev) and recorded in build log
+- [ ] Ring gear physical tooth count verified by visual count and recorded in build log
+- [ ] `teeth_per_rev` in active profile = `physical_teeth / reduction_ratio` (NOT physical_teeth, NOT physical_teeth - 1)
 - [ ] Filed sync tooth aligned with TDC ± one tooth; alignment verified by strobe at first start
 - [ ] `sync_tooth_index` set so the first edge after the gap fires at TDC (default `0`)
-- [ ] `tooth_min_us` < normal tooth period at redline (e.g., < 70 µs at N=90, 9500 RPM); default `50` is OK at N=90
-- [ ] `tooth_max_us` > missing-tooth gap at minimum cranking speed (default `30000` covers N=90 down to ~50 RPM)
-- [ ] Hall sensor output verified clean on scope under hand-spinning the clutch — N-1 pulses per rev, one wider gap, no chatter
+- [ ] `tooth_min_us` < normal tooth period at redline (e.g., < 301 µs at `teeth_per_rev=21`, 9500 RPM); default `300` is OK at the worked example
+- [ ] `tooth_max_us` only needs to bound NORMAL teeth — the missing-tooth gap is captured by `missing_tooth_ratio` BEFORE the range check
+- [ ] `missing_tooth_ratio` (Dash EMTR) tuned so a real gap consistently triggers but normal-tooth jitter does not (default `1.8`, range 1.2..3.0)
+- [ ] Hall sensor output verified clean on scope under hand-spinning the clutch — `teeth_per_rev - 1` pulses per crank rev, one wider gap, no chatter
 - [ ] Sensor air gap confirmed at 0.5-1.5 mm at unfiled teeth AND at the gap
 - [ ] Steel filings cleaned from inside clutch cover after gear modification
-- [ ] Sensor cable strain-relieved at both ends with O-ring or gland
+- [ ] Sensor mounted on back face of clutch assembly (not protruding externally); cable exits via rubber grommet, strain-relieved at the case wall
 - [ ] Speed sensor frontend tested with magnet swept across by hand
 - [ ] MAX6675 reads ambient temperature ±5 °C steady state
 
@@ -1083,7 +1123,7 @@ ECU failsafe:
 - [ ] Geometry-changed configs trigger reboot-required flag
 - [ ] Profile saves to `ecu_profile.json` AND `ecu_profile.bak.json`
 - [ ] Backup recovery tested (delete primary, verify restore from backup)
-- [ ] No `FAULT_ISR_OVERRUN` observed on Dash at 9000+ RPM during bench rev sweep (gap-detection + 90-tooth ISR throughput stays under `ISR_OVERRUN_LIMIT_US`)
+- [ ] No `FAULT_ISR_OVERRUN` observed on Dash FLOG screen at 9000+ RPM during bench rev sweep (per-tooth ISR work + per-rev reference path stays under `ISR_OVERRUN_LIMIT_US`)
 
 Mechanical:
 - [ ] ECU enclosure rubber-isolated from engine case
@@ -1129,6 +1169,13 @@ Engine-state TLVs:
 - 8 ECU cycle id u32
 - 9 Spark counter u32
 - 10 Ignition output u8
+- 11 Fault log (optional, omitted entirely if no faults). Variable length:
+  N entries × 20 bytes, where N is 1..8. Each entry is packed little-endian:
+  `fault_bit u32 | rpm u16 | tooth_period_us u32 | avg_period_us u32 | timestamp_ms u32 | count u16`.
+  ECU adds a new entry the first time a `fault_bit` is raised; subsequent
+  occurrences of the same bit increment `count` and refresh `timestamp_ms`
+  + the captured RPM/tooth_period/avg_period in place. The ring buffer
+  holds up to 8 unique fault bits.
 
 Config TLVs:
 - 1 Mode u8 (PREVIEW=0, APPLY=1, COMMIT=2)
@@ -1148,12 +1195,13 @@ Persistent files on ECU filesystem:
 - ecu_profile.bak.json (backup)
 - ecu_profile.tmp.json (temp write)
 
-Default profile fields and shipped values (Strategy B — multi-tooth ring gear with one tooth filed):
+Default profile fields and shipped values (Strategy B — multi-tooth reduction ring gear with one tooth filed):
 - schema = 1
-- teeth_per_rev = 90 (placeholder; confirm by visual count when the engine is opened)
+- teeth_per_rev = 21 (worked-example placeholder = 84 physical teeth / 4:1 reduction; confirm both numbers when the engine is opened)
 - sync_tooth_index = 0 (the first edge after the missing-tooth gap)
-- tooth_min_us = 50 (covers N=90 at 9500 RPM with margin; at N=100, 9500 RPM the period is 63 µs so 50 is still OK)
-- tooth_max_us = 30000 (covers the missing-tooth gap at ~50 RPM cranking with N=90)
+- tooth_min_us = 300 (covers `teeth_per_rev=21` at 9500 RPM with a thin margin)
+- tooth_max_us = 8000 (bounds NORMAL teeth only — generous enough for ~340 RPM crank during pedal start; the missing-tooth gap is captured by `missing_tooth_ratio` BEFORE the range check, so this no longer needs to cover the gap interval)
+- missing_tooth_ratio = 1.8 (multiplier applied to running EMA tooth period; first edge whose dt exceeds `tooth_period × ratio` is taken as the post-gap reference and resets `tooth_index` to `sync_tooth_index`)
 - debounce_us = 40
 - sync_edges_to_lock = 8
 - safe_fire_delay_us = 2500
@@ -1168,16 +1216,19 @@ Sanitize/clamp rules include:
 - tooth_max_us: 200..500000 and > tooth_min_us
 - debounce_us: 10..5000
 - sync_edges_to_lock: 1..64
+- missing_tooth_ratio: 1.2..3.0 (float)
 - safe_fire_delay_us: 500..25000
 - safe_dwell_us: 800..4000
 - map domains are clamped and normalized (sorted, dedup x)
 
-Sanity rule for `tooth_min_us` / `tooth_max_us` at multi-tooth setups:
+Sanity rules for `tooth_min_us` / `tooth_max_us` / `missing_tooth_ratio` at multi-tooth setups:
 ```
-tooth_min_us  <  60_000_000 / (peak_RPM × teeth_per_rev)
-tooth_max_us  >  2 × 60_000_000 / (min_cranking_RPM × teeth_per_rev)
+tooth_min_us         <  60_000_000 / (peak_RPM × teeth_per_rev)
+tooth_max_us         >  60_000_000 / (min_normal_cranking_RPM × teeth_per_rev)
+missing_tooth_ratio  >  ~1.2  (else normal tooth jitter trips it)
+missing_tooth_ratio  <  ~2.0  (else a real gap might not exceed it)
 ```
-The factor of 2 on `tooth_max_us` exists because the missing-tooth gap is twice the normal tooth period. If `tooth_max_us` is too tight, the gap edge will be rejected as a range violation (`FAULT_UNSTABLE_SYNC` after `GEAR_RANGE_STREAK_LIMIT` failures).
+With explicit gap detection now implemented, `tooth_max_us` only bounds NORMAL teeth. A long-period interval that exceeds `tooth_period_us × missing_tooth_ratio` is taken as the missing-tooth reference BEFORE the range check fires, so the gap no longer needs to fit under `tooth_max_us`.
 
 Apply behavior (ecu/main.py):
 - PREVIEW: validate/sanitize only
@@ -1187,7 +1238,7 @@ Apply behavior (ecu/main.py):
 
 ## Dash Settings and ECU Config UI
 
-Settings count: 17 entries.
+Settings count: 19 entries.
 
 Local Dash entries:
 - DBNC: rpm_debounce_us (2000..9000, step 100)
@@ -1205,24 +1256,82 @@ ECU-edit entries (sent over UART):
 - EMAX: ecu_tooth_max_us (200..500000, step 100)
 - ESFD: ecu_safe_fire_delay_us (500..25000, step 100)
 - ESDW: ecu_safe_dwell_us (800..4000, step 50)
+- EMTR: missing_tooth_ratio (1.2..3.0, step 0.1) — gap-detection threshold
 - ECMT: commit action with confirm
 
 Other menu actions:
+- TMAP: open the timing-map editor
 - RSET: reset settings defaults (confirm)
 - TRIP: read-only trip display
 - TCLR: trip clear (confirm)
+
+### Main screen layout
+
+- Top: RPM bar (x=4..99) and ECU badge (text "ECU" at x=100..123, status square at x=124..127). The badge no longer overlaps the bar or its tick marks.
+- Middle: large speed digits with "km/h" suffix.
+- Bottom-left: **live commanded ignition advance** (replaces the previous odometer display). Format `ADV XX.XXd` showing the advance in degrees (centidegrees / 100). When the link is lost or RPM is invalid: `ADV --.-d`. When `ignition_mode == INHIBIT`: `ADV INH`. When `ignition_mode == SAFE`: `ADV SAF`. The dash recomputes this locally by interpolating the cached advance map at the current RPM — no extra TLV is added to the wire. The odometer is still persisted (`trip_mm`/`odo_mm` written to `dashboard_settings.json`) and is shown on the info screen; only the main-screen position has changed.
+- Bottom-right: temperature.
+
+### Fault log screen (FLOG)
+
+The fault log screen replaces the previous direct info → graph jump in the dash navigation. Navigation chain:
+
+```
+main  --(OK_LONG)-->  info  --(RIGHT)-->  flog  --(RIGHT past last entry)-->  graph
+                                                  --(LEFT past first entry)--> info
+                                                  --(OK)----------------------> main
+```
+
+Inside FLOG:
+- LEFT/RIGHT pages through entries (one fault per screen).
+- OK exits to main.
+- If the log is empty, the screen shows `FLOG CLEAR` and RIGHT goes directly to graph.
+
+Each populated screen shows:
+- Row 1: `FLOG N/M` — entry index / total populated entries.
+- Row 2: short fault name.
+- Row 3: plain-English description.
+- Row 4: RPM at fault (`R<rpm>`), instantaneous tooth period at fault (`TP<microseconds>`).
+- Row 5: occurrence count (`N<count>`) and seconds since last occurrence (`T-<seconds>s`, computed against the ECU's own clock).
+
+Plain-English fault descriptions:
+
+| Fault bit | Short name | Description |
+|---|---|---|
+| FAULT_SYNC_TIMEOUT (1<<0) | SYNC TIMEOUT | No teeth seen >250ms |
+| FAULT_EDGE_PLAUSIBILITY (1<<1) | EDGE BAD | Implausible tooth edge |
+| FAULT_UNSCHEDULABLE (1<<2) | UNSCHED | Fire delay too short |
+| FAULT_STALE_EVENT (1<<3) | STALE FIRE | Missed fire window |
+| FAULT_ISR_OVERRUN (1<<4) | ISR SLOW | ISR took >20us |
+| FAULT_SAFETY_INHIBIT (1<<5) | KILL ACTIVE | Kill switch open |
+| FAULT_UNSTABLE_SYNC (1<<6) | SYNC UNSTABLE | Noise on crank signal |
 
 ## Operating Modes
 
 Dash modes:
 - Main screen
-- Info screen (OK long from main)
-- Graph screen (RIGHT from info)
+- Info screen (OK_LONG from main)
+- Fault log screen (RIGHT from info)
+- Graph screen (RIGHT from fault log; or RIGHT from fault log when log is empty)
 - Settings screen (OK from main)
 
 ECU sync/mode states:
 - Sync: LOST, SYNCING, SYNCED
 - Ignition: INHIBIT, SAFE, PRECISION
+
+### ECU Onboard LED (GP25) — Sync Status Indicator
+
+The ECU firmware drives the GP25 onboard LED to mirror the current sync state. This is the **primary** sync indicator during pedal-up bring-up — a rider can read it at a glance from the saddle without looking at the Dash.
+
+| LED pattern | Sync state | Period |
+|---|---|---|
+| Slow blink | SYNC_LOST | ~600 ms |
+| Fast blink | SYNC_SYNCING | ~220 ms |
+| Solid on | SYNC_SYNCED | n/a |
+
+Pedal-start workflow: the rider pedals the bike (or pulls recoil); the engine sees multiple crank revolutions before the clutch dumps and the engine fires. SYNC_SYNCING and IGN_MODE_SAFE firing during this acquisition window is expected and normal — the firmware needs `sync_edges_to_lock` consistent edges before it declares SYNC_SYNCED. Wait for the LED to go solid before dumping the clutch for the cleanest first ignition (precision-mode, map-driven timing). The engine WILL also catch in SAFE mode if the clutch is dumped earlier (fixed `safe_fire_delay_us`), but SYNCED is preferable.
+
+This behaviour is implemented entirely in `led_tick()` in `ecu/main.py` and requires no Dash interaction. Make sure the ECU enclosure has a small light pipe or clear epoxy window so GP25 is visible.
 
 ## Programming and Flashing
 
@@ -1363,3 +1472,12 @@ Dash-only bench mode:
   - Fixed `mul_div_smallint` to round toward zero for negative `advance_cd` values (previously used Python floor division, which biased negative advance by ~1 µs and made positive/negative advance asymmetric).
   - Removed redundant `sanitize_profile` calls on save: refactored `ecu/config_layer.py` to compute CRC over already-clean profiles via a new internal `_crc_for_clean` / `_atomic_write_clean` helper. `save_profile_pair` now sanitizes once and writes twice instead of three sanitizes per write × two writes.
   - Added worked-example math and ISR-throughput notes for N=90, 9000 RPM in the Timing and Control Model section. Added reference to filing-alignment offset correction by ±1 in `sync_tooth_index` (one tooth ≈ 4° at N=90).
+
+- 2026-04-27
+  - **Architecture correction — reduction gear ratio.** The earlier assumption that the dry-clutch ring gear rotates at crank speed (1:1) was wrong. The ring gear is a REDUCTION gear and rotates slower than the crank by some 3:1..5:1 ratio (to be measured on engine arrival). Rewrote Sync Strategy, Crank Sensor, Mechanical Mounting, Timing and Control Model, default profile, and validation checklist to use `teeth_per_rev = physical_teeth / reduction_ratio`. Added an explicit Reduction-Ratio Measurement Procedure (mark crank + ring gear, rotate crank by hand, count crank revs per ring gear rev). Worked-example placeholder is now 84 physical teeth × 4:1 reduction → `teeth_per_rev = 21`, `tooth_min_us = 300`, `tooth_max_us = 8000`.
+  - **Implemented missing-tooth detection.** `CRANK_GEAR_LAYER.on_edge` now tests `dt_us > tooth_period_us × missing_tooth_ratio` AFTER debounce and BEFORE the range check. When that condition holds and a stable EMA tooth period has been established, the firmware resets `tooth_index = sync_tooth_index`, updates the period, and returns `GEAR_EDGE_REFERENCE` — pinning the reference edge directly to the gap on every revolution instead of walking modulo N. Crucial: the check runs BEFORE the range_streak counter increments, so the gap interval no longer accumulates toward `GEAR_ERR_RANGE`. Added `missing_tooth_ratio` to the profile schema (clamp 1.2..3.0, default 1.8) and to the Dash menu as `EMTR` (step 0.1) and to the Dash → ECU config sender (`mtr` alias).
+  - **Structured fault log.** Added a ring buffer of 8 fault entries on the ECU, populated inside `set_fault()` with the current RPM, instantaneous tooth period, EMA tooth period, ECU `ticks_ms`, and an occurrence count. Repeats of the same fault bit increment count and refresh in place. Added `TLV_FAULT_LOG (=11)` — variable-length, omitted entirely when no faults are populated; Dash `MAX_PAYLOAD_LEN` bumped from 128 to 256 to accommodate the fault log payload alongside the rest of engine state. Dash decodes the new TLV into `EngineSnapshot.fault_log` and exposes a new FLOG screen (one entry per page, paged with LEFT/RIGHT, OK exits). Navigation chain is now `info → flog → graph` instead of `info → graph` direct.
+  - **Documented ECU LED sync indicator.** `led_tick()` was already implementing slow-blink / fast-blink / solid-on for SYNC_LOST / SYNC_SYNCING / SYNC_SYNCED. Added explicit documentation of this behaviour to the Operating Modes section and to the pedal-start procedure in the build manual — the ECU LED is the primary sync indicator during pedal-up; the rider waits for solid-on before dumping the clutch.
+  - **Main screen layout.** Replaced the bottom-left odometer display with the live commanded ignition advance (`ADV XX.XXd`, with `ADV INH` / `ADV SAF` / `ADV --.-d` for non-precision states). The dash recomputes advance locally from the cached advance map and current RPM via a new `_interp_map` matching the ECU's algorithm — no new TLV. Odometer remains persisted and is shown on the info screen. Reduced `RPM_BAR_W` from 120 to 96 and moved the ECU badge status square to x=124 so the badge no longer overlaps the bar or its tick marks.
+  - **Pedal-start guidance.** Added an explicit pedal-start section to the sync acquisition stage: the engine sees multiple crank revolutions before the clutch dumps; SYNC_SYNCING / IGN_MODE_SAFE firing during initial acquisition is expected and normal; the rider should watch the ECU LED and wait for solid (SYNCED) before dumping the clutch for best first-start behaviour, but the engine will also catch in SAFE mode if the clutch is dumped earlier.
+  - **Sensor mounting clarification.** The Hall sensor is mounted on the BACK FACE of the clutch assembly (sensor body inside the assembly, cable exits via a rubber grommet) — it does not protrude externally and reads the ring gear teeth from the inner side. Updated mechanical mounting and validation checklist accordingly.
