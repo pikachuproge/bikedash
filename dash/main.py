@@ -323,7 +323,7 @@ FAULT_NAMES = (
     (FAULT_EDGE_PLAUSIBILITY, "EDGE BAD",      "Implausible tooth edge"),
     (FAULT_UNSCHEDULABLE,     "UNSCHED",       "Fire delay too short"),
     (FAULT_STALE_EVENT,       "STALE FIRE",    "Missed fire window"),
-    (FAULT_ISR_OVERRUN,       "ISR SLOW",      "ISR took >20us"),
+    (FAULT_ISR_OVERRUN,       "ISR SLOW",      "ISR took >30us"),
     (FAULT_SAFETY_INHIBIT,    "KILL ACTIVE",   "Kill switch open"),
     (FAULT_UNSTABLE_SYNC,     "SYNC UNSTABLE", "Noise on crank signal"),
 )
@@ -1029,6 +1029,10 @@ rpm_period_count = 0
 spd_ticks = 0
 spd_value = 0
 speed_last_pulse_ms = utime.ticks_ms()
+speed_pulse_period_ms = 0  # latest raw inter-pulse period (ms); 0 = not yet known
+speed_period_buf = [0, 0, 0]  # ring buffer of last 3 periods for median filter
+speed_period_buf_idx = 0
+speed_period_buf_count = 0
 
 # Sensor/telemetry view values used by UI flow
 legacy_temp = None
@@ -1309,9 +1313,18 @@ def spd_interrupt(pin):
     if demo_mode_enabled:
         return
 
-    global spd_ticks, speed_last_pulse_ms
+    global spd_ticks, speed_last_pulse_ms, speed_pulse_period_ms
+    global speed_period_buf_idx, speed_period_buf_count
+    now_ms = utime.ticks_ms()
+    dt = utime.ticks_diff(now_ms, speed_last_pulse_ms)
+    if dt >= 10:
+        speed_pulse_period_ms = dt
+        speed_period_buf[speed_period_buf_idx] = dt
+        speed_period_buf_idx = (speed_period_buf_idx + 1) % 3
+        if speed_period_buf_count < 3:
+            speed_period_buf_count += 1
+    speed_last_pulse_ms = now_ms
     spd_ticks += 1
-    speed_last_pulse_ms = utime.ticks_ms()
 
 
 
@@ -1427,6 +1440,13 @@ def get_rpm_legacy():
     return rpm_value
 
 
+def _spd_median3(a, b, c):
+    if a > b: a, b = b, a
+    if b > c: b, c = c, b
+    if a > b: a, b = b, a
+    return b
+
+
 def update_speed_legacy():
     if demo_mode_enabled:
         return
@@ -1437,6 +1457,10 @@ def update_speed_legacy():
     irq_state = disable_irq()
     ticks = spd_ticks
     spd_ticks = 0
+    raw_period_ms = speed_pulse_period_ms
+    buf = (speed_period_buf[0], speed_period_buf[1], speed_period_buf[2])
+    buf_count = speed_period_buf_count
+    last_ms = speed_last_pulse_ms
     enable_irq(irq_state)
 
     now_ms = utime.ticks_ms()
@@ -1448,16 +1472,24 @@ def update_speed_legacy():
 
     if speed_pulses_per_rev > 0 and wheel_size_mm > 0:
         circ_mm = (wheel_size_mm * 31416) // 10000
-        dist_num = ticks * circ_mm
-        denom = speed_pulses_per_rev * elapsed_ms * 10
-        if denom > 0:
-            spd_value = (dist_num * 36) // denom
-        else:
-            spd_value = 0
 
-        dist_int = (dist_num + (speed_pulses_per_rev // 2)) // speed_pulses_per_rev
-        if dist_int > 0:
-            apply_distance_mm(dist_int)
+        if utime.ticks_diff(now_ms, last_ms) >= SENSOR_STATUS_TIMEOUT_MS:
+            spd_value = 0
+        elif buf_count >= 3:
+            # Median of last 3 periods: absorbs single-cycle glitch pulses
+            # (e.g. signal generator firing an extra pulse on frequency change)
+            # while still converging in 2 pulses after a genuine speed change.
+            period_ms = _spd_median3(buf[0], buf[1], buf[2])
+            spd_value = (circ_mm * 36) // (speed_pulses_per_rev * period_ms * 10)
+        elif raw_period_ms > 0:
+            spd_value = (circ_mm * 36) // (speed_pulses_per_rev * raw_period_ms * 10)
+        # else: no periods yet — keep previous spd_value (zeroed by timeout above)
+
+        # Odometry: still tick-based (correct: counts actual distance)
+        if ticks > 0:
+            dist_int = (ticks * circ_mm + (speed_pulses_per_rev // 2)) // speed_pulses_per_rev
+            if dist_int > 0:
+                apply_distance_mm(dist_int)
     else:
         spd_value = ticks * speed_multiplier
 

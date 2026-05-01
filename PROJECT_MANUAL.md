@@ -1,6 +1,6 @@
 # Bike2 Project Manual (Living Document)
 
-Last updated: 2026-04-27
+Last updated: 2026-05-01
 
 This is the single-source reference for the current Bike2 project.
 
@@ -8,7 +8,9 @@ It covers:
 - Full feature set (ECU + Dash)
 - Wiring and pin maps
 - UART protocol and config payloads
-- Programming/flashing workflow
+- ECU v2 hybrid C / PIO / MicroPython architecture
+- Building the custom MicroPython firmware
+- Programming/flashing workflow (now a two-step build-then-deploy)
 - Runtime configuration and persistence
 - Bench test + troubleshooting procedures
 
@@ -18,70 +20,111 @@ This file is intended to be continuously maintained.
 
 Whenever any of these change, this file must be updated in the same work session:
 - dash/main.py
-- ecu/main.py
-- ecu/config_layer.py
-- hardware/kicad/*
+- ecu_v2/c_core/* (any C real-time core source, including `crank_capture.pio`)
+- ecu_v2/micropython/main.py
+- ecu_v2/micropython/ecu_native.c
+- ecu_v2/micropython/config_layer.py
+- ecu_v2/micropython/micropython.cmake
+- ecu_v2/CMakeLists.txt (top-level build glue / standalone unit-test target)
+- ecu/main.py (legacy v1 — frozen, kept only as bench reference)
+- ecu/config_layer.py (legacy v1 — frozen)
+- hardware/* (wiring, BOM, legacy PCB)
 
 Update checklist per change:
 - Architecture impact
 - Pinout or wiring impact
 - Protocol/TLV impact
 - Config/persistence impact
+- Build-firmware impact (USER_C_MODULES, PIO program, IPC layout)
 - Flash/run instructions impact
 - Troubleshooting impact
 
 ## Repository Layout
 
-- dash/main.py
-  Dash firmware (OLED UI, buttons, telemetry ingest, config sender, demo mode, persistence)
-- ecu/main.py
-  ECU firmware (crank decode, ignition scheduling, safety, telemetry source, config ingest)
-- ecu/config_layer.py
-  ECU profile schema, sanitize/clamp rules, CRC, atomic save + recovery
-- main.py
-  Legacy single-Pico dashboard implementation (kept for compatibility)
-- hardware/kicad/
-  PCB build pack (spec, nets, BOM, placement)
+- ecu_v2/                        — current production ECU firmware (hybrid C/PIO/MicroPython)
+  - ARCHITECTURE.md              — design + root-cause analysis of v1 failures
+  - CMakeLists.txt               — top-level CMake glue for desktop / unit-test builds
+  - c_core/                      — real-time C core that runs on Core 1
+    - ecu_types.h                — shared enums (sync state, ignition mode, fault bits, limits)
+    - ipc.h / ipc.c              — single shared struct: telemetry seqlock, profile shadow + commit, SPSC fault ring, command block
+    - crank.h / crank.c          — PIO IRQ drain, debounce, missing-tooth detection, sync state machine, soft-tick RPM publish
+    - scheduler.h / scheduler.c  — hardware-alarm scheduling of dwell-on / fire (Pico SDK alarm pool)
+    - ignition.h / ignition.c    — coil GPIO; force-off path is callable from any context
+    - safety.h / safety.c        — inhibit pin polling + soft inhibit from MP
+    - faults.h / faults.c        — fault bits + fault ring producer with 100 ms coalescing
+    - advance_map.h / advance_map.c — pure linear-interp lookups (rpm → advance_cd, rpm → dwell_us)
+    - ecu_core.h / ecu_core.c    — wires PIO + DMA + IRQs + alarm pool, launches Core 1
+    - crank_capture.pio          — 4-instruction PIO program: timestamp every rising edge on GP2 into the RX FIFO
+  - micropython/                 — MicroPython surface
+    - main.py                    — boot, UART telemetry framing (50 Hz), config TLV ingest + sanitize
+    - ecu_native.c               — MicroPython native module: `ecu.start()`, `ecu.read_state()`, `ecu.set_profile()`, `ecu.drain_faults()`, `ecu.set_inhibit()` …
+    - config_layer.py            — profile schema, sanitize/clamp, CRC, atomic save + recovery (kept verbatim from v1 for wire/disk compatibility)
+    - micropython.cmake          — USER_C_MODULES wiring (consumed by the MicroPython rp2 port build)
+- dash/main.py                   — Dash firmware (SSD1309 OLED UI, buttons, telemetry ingest, config sender, demo mode, persistence)
+- ecu/                           — legacy v1 ECU firmware (frozen — kept as bench reference only)
+  - main.py
+  - config_layer.py
+- hardware/                      — wiring, BOM, legacy PCB files
+
+The single-Pico legacy `main.py` at the repo root has been removed.
 
 ## System Architectures
 
-### Current Primary Architecture (Dual Pico)
+### Current Primary Architecture (Dual Pico, ECU is hybrid C/PIO/MicroPython)
 
-- ECU Pico
-  Owns ignition execution and crank timing.
-  Sends engine telemetry to Dash.
-  Accepts config proposals from Dash.
-- Dash Pico
-  Owns UI, menu, display, and config editing.
-  Never drives ignition directly.
+- ECU Pico (RP2350 / Pico 2)
+  - Custom MicroPython firmware with the C real-time core compiled in as a USER_C_MODULES native module.
+  - Core 1 owns ignition: PIO state machine timestamps every rising edge on GP2; an IRQ handler decodes teeth and arms hardware alarms for dwell-on and fire. There is **no Python code on the ignition path**.
+  - Core 0 runs MicroPython for UART telemetry, config TLV ingest, profile sanitize, and persistence.
+  - Cross-core / cross-language traffic goes through ONE shared `ecu_ipc_t` struct (seqlock telemetry, double-buffered profile shadow + commit, SPSC fault ring).
+- Dash Pico (RP2350 / Pico 2)
+  - Stock MicroPython firmware + `dash/main.py`.
+  - Owns UI, menu, display, and config editing. Never drives ignition directly.
 
-### Legacy Compatibility Architecture (Single Pico)
+### Legacy v1 ECU (kept as bench reference, NOT recommended)
 
-- Uses root main.py and direct local sensors.
-- Hardware docs under hardware/kicad are based on this mapping.
+`ecu/main.py` is a pure-MicroPython implementation that suffered from soft-IRQ / interpreter overhead at engine-relevant tooth rates. Documented failure on the signal-generator bench:
+
+| Tooth rate | RPM (tpr=21) | Observed                                         |
+| ---------- | ------------ | ------------------------------------------------ |
+| ~1.2 kHz   | ~3 400       | ~1000 `FAULT_ISR_OVERRUN`/s, ~50 `FAULT_STALE_EVENT`/s |
+| ~2.2 kHz   | ~6 300       | UART telemetry stalls, runtime occasionally crashes outright |
+
+The v1 firmware is preserved because (a) its profile schema and UART wire protocol are byte-for-byte identical to v2, so the same dash firmware works against either, and (b) it serves as the regression baseline for the v2 migration gates documented in `ecu_v2/ARCHITECTURE.md`. Do not deploy v1 to a real engine.
 
 ## Feature Set
 
-## ECU Features (ecu/main.py)
+## ECU Features (ecu_v2)
 
-- Gear-tooth crank position model
-  CRANK_GEAR_LAYER with sync acquisition and timeout handling.
-- Ignition modes
-  IGN_MODE_INHIBIT, IGN_MODE_SAFE, IGN_MODE_PRECISION.
-- Safety paths
-  Safety inhibit input, stale-event guards, unschedulable guards, ISR overrun faulting.
-- Deterministic scheduling
-  IRQ edge capture + timer tick execution for coil ON/OFF event slots.
-- Telemetry transmission
-  Framed binary protocol with CRC16 and TLV payload.
-- Config ingestion
-  Framed config packets from Dash (preview/apply/commit).
-- Safe runtime apply
-  Applies pending config only in safe window (not in precision, no armed events, coil off).
-- Geometry-change gating
-  Geometry-related changes are marked reboot-required.
-- Persistent profile load
-  Loads ECU profile on boot with backup recovery.
+Real-time core (C, runs on Core 1):
+- PIO crank capture
+  4-instruction PIO program on PIO0 SM0 watches GP2; on every rising edge it pushes a marker word into the RX FIFO and asserts the SM IRQ. The CPU-side IRQ handler samples `time_us_64()` once at entry and processes one edge per invocation (level-triggered FIFO IRQ re-pends if more are queued). No allocation, no FP, no interpreter.
+- Crank decoder
+  Debounce (config `debounce_us`), missing-tooth gap detection (`dt × 10 > period × mtr_x10` runs BEFORE the range check), tooth-period EMA `(period × 3 + dt) / 4`, sync edge counter, range/noise streak limiters, sync state machine (LOST → SYNCING → SYNCED).
+- Hardware-alarm scheduler
+  On every reference edge the scheduler computes (fire_at, dwell_on_at) and arms two alarms in the SDK's alarm pool (Core-1 owned). Each alarm carries the cycle id; if a newer reference edge comes in early, `armed_cycle_id` is bumped and the stale callback drops itself silently. There is no polling tick on the ignition path.
+- Three-place safety inhibit
+  Checked in (a) the soft tick, (b) immediately before arming a new pair, (c) inside the dwell-on alarm callback. Any one of them seeing inhibit = no spark. Hardware (active-low GP14) and software (`ecu.set_inhibit(True)`) are OR'd.
+- Fault coalescing
+  Same fault bit hitting the ring within 100 ms is suppressed (avoids buffer flooding under sustained noise). `set_fault()` captures bit, current RPM, instantaneous tooth period, EMA tooth period, ECU `ticks_ms`, and an occurrence count.
+- 1 kHz soft tick
+  Owns sync timeout (250 ms), range/noise promotion to faults, RPM publish, profile-commit boundary check (only swap when scheduler is quiescent).
+
+MicroPython surface (Core 0):
+- Boot
+  Loads sanitized profile via `config_layer.load_profile_with_recovery()`, calls `ecu.start()` (which initializes hardware, launches Core 1, and returns once Core 1 reports ready), pushes profile + CRC into the C shadow.
+- 50 Hz telemetry framing
+  Pulls `ecu.read_state()` (seqlock-safe snapshot) + `ecu.drain_faults()` (SPSC ring drain), packs TLVs, frames with CRC16-CCITT, writes to UART. No IRQ.
+- Config TLV ingest
+  Wire protocol byte-for-byte identical to v1. Compact field aliases (`tpr`/`sti`/`tmin`/...) expand to full keys; merged with last applied profile; sanitized via `config_layer.sanitize_profile()`. Geometry-changing fields (teeth_per_rev, sync_tooth_index, tooth_min/max_us, debounce_us, sync_edges_to_lock) are reboot-required — they persist via COMMIT but do NOT push to the C shadow at runtime. Non-geometry fields apply at runtime via shadow + atomic commit on the next quiet boundary.
+- Persistence
+  Atomic `_atomic_write_clean` (tmp file → rename), CRC-tagged active + backup pair (`ecu_profile.json`, `ecu_profile.bak.json`), `load_profile_with_recovery()` falls back to backup on corruption.
+
+What is INTENTIONALLY absent compared to v1:
+- No `Pin.irq()` handler — PIO + C handle every crank edge.
+- No `machine.Timer` callback for the scheduler — the SDK alarm pool is the only thing arming fire/dwell events.
+- No `disable_irq() ... enable_irq()` windows — the IPC seqlock and SPSC ring handle concurrency without locking out the hardware path.
+- No allocation, no `ujson` parsing, no big-int math on any IRQ.
 
 ## Dash Features (dash/main.py)
 
@@ -901,7 +944,7 @@ The ECU firmware already implements the timing path. With Strategy B (multi-toot
 fire_delay_us = rev_period_us - (rev_period_us × advance_cd / 36000)
 ```
 
-where `rev_period_us` is the measured full crankshaft period (`tooth_period_us × teeth_per_rev`), and `advance_cd` is the desired advance in centidegrees from the lookup map. This is the formula in `arm_precision_from_edge` ([ecu/main.py](ecu/main.py)).
+where `rev_period_us` is the measured full crankshaft period (`tooth_period_us × teeth_per_rev`), and `advance_cd` is the desired advance in centidegrees from the lookup map. In v2 this formula lives in `scheduler_arm_for_reference()` ([ecu_v2/c_core/scheduler.c](ecu_v2/c_core/scheduler.c)); in legacy v1 it was `arm_precision_from_edge` in [ecu/main.py](ecu/main.py).
 
 For TCI, the firmware also schedules the **dwell** event ahead of the fire:
 
@@ -933,7 +976,7 @@ fire_delay_us   = 6_316 - (6_316 × 1500 / 36000)
                 ≈ 6_316 - 263                   ≈ 6_053 µs
 ```
 
-Per-tooth ISR throughput at 9500 RPM × 21 = 3 325 edges/sec, one edge every ~301 µs — much lower than the previous 90-tooth assumption (~74 µs/edge), so the per-tooth ISR has comfortable headroom under `ISR_OVERRUN_LIMIT_US = 100`. The advance-map size is no longer ISR-throughput-limited at this geometry; the same defaults are kept for compatibility.
+Per-tooth ISR throughput at 9500 RPM × 21 = 3 325 edges/sec, one edge every ~301 µs — much lower than the previous 90-tooth assumption (~74 µs/edge), so the per-tooth ISR has comfortable headroom under either firmware's overrun budget (v1 `ISR_OVERRUN_LIMIT_US = 100 µs` in [ecu/main.py](ecu/main.py); v2 `ECU_ISR_OVERRUN_LIMIT_US = 30 µs` in [ecu_v2/c_core/ecu_types.h](ecu_v2/c_core/ecu_types.h)). The advance-map size is no longer ISR-throughput-limited at this geometry; the same defaults are kept for compatibility.
 
 Critical rule for 2-stroke timing:
 - Advance angle MUST decrease (retard) past peak power RPM. Over-advance at high RPM detonates the 2-stroke and destroys it. A typical curve for a kit 85cc:
@@ -947,9 +990,11 @@ Critical rule for 2-stroke timing:
 These are class-typical numbers. Tune on YOUR engine using spark-plug colour and a knock listener.
 
 Missed-pulse handling (already in ECU code):
-- Sustained sync timeout (no edges within `SYNC_TIMEOUT_US = 250 ms`) → drop to SYNC_LOST → INHIBIT.
-- Period plausibility violations stack into FAULT_EDGE_PLAUSIBILITY; degrade to SAFE mode after `MAX_UNSCHED_STREAK_PRECISION = 4` consecutive failures.
+- Sustained sync timeout (no edges within `ECU_SYNC_TIMEOUT_US = 250 ms`, v1 name `SYNC_TIMEOUT_US`) → drop to SYNC_LOST → INHIBIT.
+- Period plausibility violations stack into FAULT_EDGE_PLAUSIBILITY; v2 promotes after `ECU_RANGE_STREAK_LIMIT = 4` consecutive out-of-range edges (legacy v1 name was `MAX_UNSCHED_STREAK_PRECISION = 4`).
+- Noise (sub-debounce) edges promote to `FAULT_UNSTABLE_SYNC` after `ECU_NOISE_STREAK_LIMIT = 6` consecutive noise hits (v2 only).
 - After `sync_edges_to_lock` consecutive consistent edges → return to SYNCED → PRECISION mode.
+- v2 additionally enforces a 1.5 s **precision-mode re-entry lockout** (`PRECISION_REENTRY_LOCKOUT_US` in [ecu_v2/c_core/crank.c](ecu_v2/c_core/crank.c)): after a fault recovery (sync timeout, range/noise promotion), even when `sync_edge_count` is satisfied the firmware stays in SYNCING / SAFE mode for 1.5 s before allowing PRECISION. This avoids re-entering map-driven timing on freshly-recovered noisy gear state.
 
 Over-rev protection: set a hard rev limit in the ECU config. When measured RPM exceeds the limit, ECU enters INHIBIT and skips fire events. Recommended for Avenger 85 class: 9500 RPM.
 
@@ -1172,10 +1217,15 @@ Engine-state TLVs:
 - 11 Fault log (optional, omitted entirely if no faults). Variable length:
   N entries × 20 bytes, where N is 1..8. Each entry is packed little-endian:
   `fault_bit u32 | rpm u16 | tooth_period_us u32 | avg_period_us u32 | timestamp_ms u32 | count u16`.
-  ECU adds a new entry the first time a `fault_bit` is raised; subsequent
-  occurrences of the same bit increment `count` and refresh `timestamp_ms`
-  + the captured RPM/tooth_period/avg_period in place. The ring buffer
-  holds up to 8 unique fault bits.
+  In v2, repeats of the same fault bit within `FAULT_COALESCE_WINDOW_MS = 100 ms`
+  are silently dropped at the producer (the ring entry's `count` field is set
+  to 1 on every fresh push; cross-window repeats produce a new entry rather
+  than incrementing in place). Internally the ECU fault ring is
+  `ECU_FAULT_RING_LEN = 32` entries deep (SPSC, drop-on-full); `main.py`
+  caps each telemetry frame at 8 entries to fit the wire-protocol limit and
+  to match the dash's `MAX_PAYLOAD_LEN`. v1's behaviour was different:
+  the v1 ring was 8 entries with in-place coalescing — same TLV layout,
+  different producer semantics.
 
 Config TLVs:
 - 1 Mode u8 (PREVIEW=0, APPLY=1, COMMIT=2)
@@ -1302,7 +1352,7 @@ Plain-English fault descriptions:
 | FAULT_EDGE_PLAUSIBILITY (1<<1) | EDGE BAD | Implausible tooth edge |
 | FAULT_UNSCHEDULABLE (1<<2) | UNSCHED | Fire delay too short |
 | FAULT_STALE_EVENT (1<<3) | STALE FIRE | Missed fire window |
-| FAULT_ISR_OVERRUN (1<<4) | ISR SLOW | ISR took >20us |
+| FAULT_ISR_OVERRUN (1<<4) | ISR SLOW | ISR took >30us (ecu_v2 limit; v1 is 100us) |
 | FAULT_SAFETY_INHIBIT (1<<5) | KILL ACTIVE | Kill switch open |
 | FAULT_UNSTABLE_SYNC (1<<6) | SYNC UNSTABLE | Noise on crank signal |
 
@@ -1321,7 +1371,7 @@ ECU sync/mode states:
 
 ### ECU Onboard LED (GP25) — Sync Status Indicator
 
-The ECU firmware drives the GP25 onboard LED to mirror the current sync state. This is the **primary** sync indicator during pedal-up bring-up — a rider can read it at a glance from the saddle without looking at the Dash.
+The intended behaviour is to drive the GP25 onboard LED to mirror the current sync state, so a rider can read sync status at a glance from the saddle during pedal-up:
 
 | LED pattern | Sync state | Period |
 |---|---|---|
@@ -1329,52 +1379,471 @@ The ECU firmware drives the GP25 onboard LED to mirror the current sync state. T
 | Fast blink | SYNC_SYNCING | ~220 ms |
 | Solid on | SYNC_SYNCED | n/a |
 
-Pedal-start workflow: the rider pedals the bike (or pulls recoil); the engine sees multiple crank revolutions before the clutch dumps and the engine fires. SYNC_SYNCING and IGN_MODE_SAFE firing during this acquisition window is expected and normal — the firmware needs `sync_edges_to_lock` consistent edges before it declares SYNC_SYNCED. Wait for the LED to go solid before dumping the clutch for the cleanest first ignition (precision-mode, map-driven timing). The engine WILL also catch in SAFE mode if the clutch is dumped earlier (fixed `safe_fire_delay_us`), but SYNCED is preferable.
+**Status:** v1 (`ecu/main.py` `led_tick()`) implements this. **ecu_v2 has not yet ported it** — `ecu_v2/micropython/main.py` does not touch GP25 today. Until ported, use the Dash top-left "SY" badge as the sync indicator. When porting, the simplest place to add it is the MP main loop on Core 0 alongside the 50 Hz telemetry tick: read `ecu.read_state()['sync_state']` and toggle GP25 according to the table above.
 
-This behaviour is implemented entirely in `led_tick()` in `ecu/main.py` and requires no Dash interaction. Make sure the ECU enclosure has a small light pipe or clear epoxy window so GP25 is visible.
+Pedal-start workflow: the rider pedals the bike (or pulls recoil); the engine sees multiple crank revolutions before the clutch dumps and the engine fires. SYNC_SYNCING and IGN_MODE_SAFE firing during this acquisition window is expected and normal — the firmware needs `sync_edges_to_lock` consistent edges before it declares SYNC_SYNCED. Wait for the LED to go solid (or, on v2, the Dash badge to clear) before dumping the clutch for the cleanest first ignition. The engine WILL also catch in SAFE mode if the clutch is dumped earlier (fixed `safe_fire_delay_us`), but SYNCED is preferable.
+
+When ported, make sure the ECU enclosure has a small light pipe or clear epoxy window so GP25 is visible.
+
+## ECU v2 Real-Time Architecture (Detail)
+
+This section documents the hybrid C / PIO / MicroPython design as built in `ecu_v2/`. It is the authoritative reference; if anything below contradicts the code, the code wins — fix this section.
+
+### Why v2 exists
+
+The v1 firmware (`ecu/main.py`) is a pure-MicroPython implementation. Bench measurements (signal generator, Hall-input pin GP2) showed:
+
+- ~1.2 kHz tooth rate (~3 400 RPM at tpr=21): ~1000 `FAULT_ISR_OVERRUN`/s, ~50 `FAULT_STALE_EVENT`/s
+- ~2.2 kHz tooth rate (~6 300 RPM at tpr=21): UART telemetry stalls, runtime occasionally crashes outright
+
+Root causes (in order):
+1. The crank ISR runs through the MicroPython interpreter even with `hard=True` and `@micropython.native` — every `utime.ticks_us()`, global lookup, big-int product costs interpreter time. End-to-end ISR ran 30–80 µs typical, >150 µs spikes from GC.
+2. A 5 kHz polling scheduler in `machine.Timer` competed with the ISR for the same Cortex-M33 core; soft-IRQ queue saturated under load.
+3. No use of the SDK's `hardware_alarm` pool — every fire/dwell-on event was delivered by polling timestamps from the timer tick. `LATE_SLACK_US = 1500` is the design admitting it can't meet its own 200 µs window. That tolerance is the direct cause of `FAULT_STALE_EVENT`.
+4. Allocations on the IRQ paths (`bytearray` slices, `memoryview` slices, `ujson.loads()` in config, list indexing inside `disable_irq()` windows) caused non-deterministic GC pauses to collide with crank edges.
+5. UART RX/TX share Core 0 with everything else; rxbuf=256 was overrunning between sleep_ms(2) drains.
+
+The v2 design moves the ignition path off MicroPython entirely. See `ecu_v2/ARCHITECTURE.md` for the longer write-up.
+
+### Core layout
+
+```
+                            RP2350 (Pico 2)
+   ┌────────────────────────────────────────────────────────────────────┐
+   │                                                                    │
+   │   ┌──────────────────────────┐        ┌────────────────────────┐   │
+   │   │ Core 0 — MicroPython     │        │ Core 1 — C real-time   │   │
+   │   │                          │        │                        │   │
+   │   │ • UART telemetry TX 50Hz │        │ • PIO IRQ → tooth      │   │
+   │   │ • UART config RX/parse   │        │ • Sync state machine   │   │
+   │   │ • Profile sanitize/save  │        │ • Advance map interp   │   │
+   │   │ • Profile push to C core │        │ • Hardware-alarm fire/ │   │
+   │   │ • Telemetry pull from C  │        │   dwell scheduling     │   │
+   │   │                          │        │ • Soft tick @ 1 kHz    │   │
+   │   │                          │        │ • Safety inhibit poll  │   │
+   │   │   ┌──────────────────────┴────────┴───────────────────┐    │   │
+   │   │   │             SHARED RAM (g_ipc)                    │    │   │
+   │   │   │  • telemetry seqlocked (C writes / MP reads)      │    │   │
+   │   │   │  • profile_shadow[2] + active_idx (MP writes,     │    │   │
+   │   │   │    C reads — pointer swap on quiet boundary)      │    │   │
+   │   │   │  • fault_ring SPSC (C produces / MP consumes)     │    │   │
+   │   │   │  • cmd_block (MP-only writes / C-only reads)      │    │   │
+   │   │   └───────────────────────────────────────────────────┘    │   │
+   │   └──────────────────────────┘        └────────────────────────┘   │
+   │                                                  ▲                 │
+   │                                                  │ PIO0 IRQ_0      │
+   │                                  ┌───────────────┴────────────────┐│
+   │                                  │ PIO0 SM0 — crank_capture       ││
+   │                                  │ • wait 1 pin 0 (rising edge)   ││
+   │                                  │ • in pins,1; push noblock      ││
+   │                                  │ • wait 0 pin 0 (rearm)         ││
+   │                                  └────────────────┬───────────────┘│
+   │                                                   │                │
+   │  GP15 (coil drive) ◀── alarm_pool callback ◀──────┤                │
+   │                                                   │                │
+   └───────────────────────────────────────────────────┼────────────────┘
+                                                       │
+                                                  GP2 (Hall in)
+```
+
+### IPC contract (`ecu_v2/c_core/ipc.h`)
+
+A single `ecu_ipc_t g_ipc` instance in .bss. Concurrency rules per field group:
+
+- `telemetry` — **seqlock**. The 1 kHz soft tick is the sole writer. Writer increments `seq` (even→odd, write body, odd→even). Readers (MP `ecu.read_state()`) sample `seq` before+after; retry on odd or changed. Up to 8 retries before returning the snapshot anyway — at 1 kHz writer rate the reader has milliseconds of window between writes, so this almost never spins.
+- `profile_shadow[2]` + `active_idx` — **double buffer + commit**. MP writes the inactive shadow at index `!active_idx`, then sets `cmd.pending_commit = 1`. The scheduler swaps `active_idx` on the next quiet boundary (no alarm armed). The C side never observes a half-written profile.
+- `fault_ring` — **lock-free SPSC** (32 entries, power-of-two). Producer = C soft tick / scheduler; consumer = MP `ecu.drain_faults()`. Drop on full (better to lose one duplicate fault than block the soft tick).
+- `cmd` — **single-writer per field**. MP writes; C reads. `soft_inhibit`, `reset_request`, `pending_commit`, `active_idx` are atomic words.
+
+Magic / version (`ECU_IPC_MAGIC = 0xB1KE2EC0`, `ECU_IPC_VERSION = 1`) live in the struct so a future bootloader-hosted profile dump knows what it's reading.
+
+### PIO program (`crank_capture.pio`)
+
+Four instructions, runs at 1 MHz:
+
+```
+.wrap_target
+    wait 1 pin 0     ; wait for input pin = 1 (rising edge)
+    in   pins, 1     ; consume one bit (always 1) into ISR shift register
+    push noblock     ; push to RX FIFO; if full, drop
+    wait 0 pin 0     ; wait for low (rearm)
+.wrap
+```
+
+The CPU samples `time_us_64()` at the top of `crank_pio_isr()`; this introduces ~1 µs of jitter (IRQ entry latency on RP2350 at 150 MHz) which is below our 10 µs scheduling resolution. If sub-µs jitter ever becomes the limit, the program can be replaced with a hardware-timestamping variant — the FIFO contract (one word per edge) stays the same.
+
+The ISR pops AT MOST one entry per invocation. The FIFO-not-empty IRQ source is level-triggered; any remaining entries re-pend the IRQ and we re-enter immediately. Draining the whole FIFO in a single call would re-use the same `entry_us` for every edge in the batch — every batched edge would compute `dt = 0` and falsely fail debounce.
+
+### Crank decoder ordering (`crank.c::process_one_edge`)
+
+Order of checks per edge — **must not change**:
+
+1. Debounce (`dt < debounce_us` → noise_streak++, return).
+2. Update `last_dt_us` and `last_edge_us`.
+3. Missing-tooth gap: `dt × 10 > period × mtr_x10` → set `is_ref = true`, reset `tooth_index = sync_tooth_index`, clear `range_streak`.
+4. Else range check: `dt < tooth_min_us || dt > tooth_max_us` → `range_streak++`, return (do NOT update EMA).
+5. Else normal tooth: increment `tooth_index` modulo `teeth_per_rev`; if it wraps to `sync_tooth_index`, set `is_ref = true`.
+6. Update EMA: `period = (period × 3 + dt) / 4`.
+7. If `is_ref`: bump `cycle_id` and call `scheduler_arm_for_reference(edge_us, cycle_id, period)`.
+
+The gap check **must precede** the range check — at engine speed the gap is 1.8× a normal tooth period, which would always fail `dt > tooth_max_us` and trip `FAULT_EDGE_PLAUSIBILITY` if range-checked first.
+
+### Scheduler invariants (`scheduler.c`)
+
+Every one of these must hold:
+
+1. `scheduler_arm_for_reference()` writes both `armed` flags BEFORE calling `alarm_pool_add_alarm_at()` — the alarm could in principle fire inline if the time is already past, and the callback would observe `armed = false` and abort cleanly.
+2. The fire alarm callback runs `ignition_force_off()` FIRST, then increments `spark_count`. If anything panics in between, the coil ends up off.
+3. The dwell-on alarm callback double-checks its own `cycle_id` against `armed_cycle_id`. A new reference edge that arrives early bumps `armed_cycle_id`, invalidating any stale dwell-on still queued.
+4. Safety inhibit is checked in three places: (a) soft tick, (b) immediately before arming a new pair, (c) inside the dwell-on alarm callback. Any one of them seeing inhibit = no spark.
+5. The IGBT GPIO is configured with `gpio_put(COIL_PIN, 0)` in `ignition_init()` BEFORE the alarm pool is enabled. The hardware 10 kΩ gate pull-down holds it low if the C panics — `ignition_init()` is the first thing `ecu_core_start()` does.
+6. After any fault recovery (sync timeout, range-streak, noise-streak), the soft tick stamps `precision_lockout_until_us = now + 1.5 s`. Until that time elapses the soft tick downgrades any apparent SYNCED state back to SYNCING (and ignition_mode to SAFE). This is the `PRECISION_REENTRY_LOCKOUT_US = 1500000` constant in `crank.c`. A clean (no-fault) sync still locks immediately once `sync_edges_to_lock` is satisfied — the lockout only applies *after* a fault tripped the recovery path.
+
+`alarm_pool_t` is created on Core 1 by `alarm_pool_create_with_unused_hardware_alarm(8)` so the alarm IRQ vector is registered on Core 1. All alarm callbacks (soft tick, dwell-on, fire) therefore fire on Core 1. Core 0 stays clean for MicroPython / UART.
+
+### Hard limits (`ecu_types.h`)
+
+Compiled-in safety limits that MP cannot override:
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `ECU_DWELL_MIN_US` | 1200 | hard floor on dwell after map lookup |
+| `ECU_DWELL_MAX_US` | 2600 | hard ceiling on dwell after map lookup |
+| `ECU_DWELL_TARGET_US` | 1800 | dwell when map empty |
+| `ECU_LEAD_GUARD_ON_US` | 200 | dwell-on must be >= now + 200 µs to be schedulable |
+| `ECU_LEAD_GUARD_FIRE_US` | 200 | fire delay must exceed this |
+| `ECU_MIN_COIL_ON_US` | 400 | dwell must exceed this |
+| `ECU_SYNC_TIMEOUT_US` | 250000 | no edges => SYNC_LOST |
+| `ECU_RANGE_STREAK_LIMIT` | 4 | promotes to FAULT_EDGE_PLAUSIBILITY |
+| `ECU_NOISE_STREAK_LIMIT` | 6 | promotes to FAULT_UNSTABLE_SYNC |
+| `ECU_ISR_OVERRUN_LIMIT_US` | 30 | per-edge ISR runtime budget |
+| `ECU_SOFT_TICK_HZ` | 1000 | soft tick rate |
+| `ECU_FAULT_RING_LEN` | 32 | SPSC ring depth |
+
+### MicroPython native module surface (`ecu_native.c`)
+
+| Python call | Effect |
+|---|---|
+| `ecu.start() -> bool` | init hardware, launch Core 1, returns False if already started |
+| `ecu.stop()` | halt Core 1, force coil off |
+| `ecu.read_state() -> dict` | seqlock-safe snapshot — keys: `rpm`, `sync_state`, `ignition_mode`, `validity_bits`, `fault_bits`, `cycle_id`, `spark_counter`, `ignition_output`, `advance_cd`, `tooth_period_us`, `tooth_index`, `last_edge_us` |
+| `ecu.set_profile(dict)` | atomically install profile (writes inactive shadow, sets `pending_commit`) |
+| `ecu.drain_faults() -> list[dict]` | pop everything from the fault ring |
+| `ecu.set_inhibit(bool)` | software inhibit (OR'd with hardware GP14) |
+| `ecu.request_reset()` | bump gear-state reset request flag |
+| `ecu.set_profile_crc16(int)` / `ecu.get_profile_crc16() -> int` | CRC stamp used in dash response |
+| `ecu.SYNC_LOST` / `ecu.SYNC_SYNCING` / `ecu.SYNC_SYNCED` | exported constants |
+| `ecu.IGN_INHIBIT` / `ecu.IGN_SAFE` / `ecu.IGN_PRECISION` | exported constants |
+
+All of these are non-blocking shims over IPC. None disable IRQs. None block on the C core.
+
+### Migration gates (bench, signal generator)
+
+The migration is staged so a regression at any step can be caught against v1 numbers. From `ecu_v2/ARCHITECTURE.md`:
+
+| Stage | Action | Acceptance gate |
+|---|---|---|
+| 0 | Reproduce v1 baseline on bench | ~1000 ISR overruns/s @ 1.2 kHz, UART crash @ 2.2 kHz (±20 %) |
+| 1 | PIO crank capture under unmodified MP | 1.2 kHz × 10 min, zero PIO FIFO overruns |
+| 2 | Crank decode + sync state in C | 2.5 kHz × 30 min, sync stays SYNCED, zero `FAULT_EDGE_PLAUSIBILITY` |
+| 3 | Hardware-alarm scheduler in C | 5 kHz × 30 min, zero `FAULT_STALE_EVENT`/`FAULT_UNSCHEDULABLE` |
+| 4 | Full C core on Core 1 | 5 kHz × 30 min + saturated UART |
+| 5 | Profile swap under load | 1000 profile pushes during 5 kHz run, exact spark count |
+| 6 | First hardware bring-up | spark on scope at expected delay ±20 µs |
+| 7 | On-engine | starts; idle holds with no fault counts |
 
 ## Programming and Flashing
 
-## Prerequisites
+The Dash Pico runs stock MicroPython for RP2350 plus `dash/main.py` — a one-step `.uf2` flash and an `mpremote cp` of the dash script.
 
-- MicroPython installed on each Pico
-- USB connection to each board
-- mpremote (recommended)
+The ECU Pico runs a **custom MicroPython firmware**. The C real-time core (`ecu_v2/c_core/*.c`), the PIO program (`crank_capture.pio`), and the native `ecu` module (`ecu_v2/micropython/ecu_native.c`) are all compiled into the firmware as a USER_C_MODULES native module. There is no way to deliver this code over `mpremote fs cp` — it must be linked into the MicroPython port and flashed as a single `.uf2`. After the firmware is on the board, `main.py` and `config_layer.py` from `ecu_v2/micropython/` are deployed via `mpremote` exactly the same way as in v1.
 
-Install mpremote:
+The two boards therefore have different deploy procedures. Read the right section.
 
-```bash
-python -m pip install mpremote
+### Prerequisites (host machine)
+
+You will need:
+
+- A C toolchain capable of building the Pico SDK:
+  - **Windows (recommended path):** install the official **Raspberry Pi Pico Windows Installer** from https://www.raspberrypi.com/documentation/microcontrollers/pico-series.html . It bundles arm-none-eabi-gcc, CMake, Ninja, Python, `picotool`, the Pico SDK, AND a portable GNU `make` / MSYS shell, and it sets `PICO_SDK_PATH` and `PICO_TOOLCHAIN_PATH` in the **Pico shells** it creates. **You must build from one of those shells** — plain `cmd.exe` or PowerShell will not have `make` on PATH and the build will fail with `make: command not found`. From the Start menu open one of:
+    - "Pico - Visual Studio Code" (sets up env, then opens VS Code with a built-in terminal that has the toolchain on PATH), or
+    - "Developer Command Prompt for Pico" (a cmd shell with PATH and env vars pre-loaded).
+    The PowerShell snippets below assume you are inside one of these shells.
+  - **Linux:** `sudo apt install gcc-arm-none-eabi cmake ninja-build build-essential python3 git` and clone `pico-sdk` somewhere stable. (`pico-extras` is not required for this build.)
+  - **macOS:** `brew install --cask gcc-arm-embedded && brew install cmake ninja git` and clone `pico-sdk`.
+- `git` ≥ 2.20 (for the MicroPython source tree and its submodules).
+- Python 3.10+ on PATH (the MicroPython build invokes Python for code-generation steps; `pioasm` and `mpy-cross` also need it).
+- `mpremote` (`python -m pip install --user mpremote`) for filesystem deploys to each Pico.
+- A USB cable per board and BOOTSEL access to each Pico (the small white button next to USB).
+- (Recommended) `picotool` — bundled with the Windows installer; on Linux/macOS install via your package manager or build from `pico-sdk/tools/picotool`. Used for low-level erase/diagnostics; not strictly needed for the happy-path build.
+
+Decide on a workspace directory. Examples in this section assume:
+
+```
+C:\pico\           # holds pico-sdk\, micropython\, etc.
+C:\pico\bike2\     # this repository (clone of the bike2 repo)
 ```
 
-## Deploy ECU Pico
+On Linux/macOS the equivalent is e.g. `~/pico/` and `~/pico/bike2/`.
 
-From repository root:
+If you adopt a different layout, substitute the paths accordingly — the commands below are not magic, they're just GNU `make` invocations with two path arguments (`USER_C_MODULES=<…/micropython.cmake>` and an implicit `PICO_SDK_PATH`).
+
+### Step 1 — Get the Pico SDK and MicroPython sources
+
+If you used the Windows installer, the SDK is already at `%PICO_SDK_PATH%` and you can skip the `pico-sdk` clone — verify with `echo $PICO_SDK_PATH` (Bash/MSYS) or `echo %PICO_SDK_PATH%` (cmd) / `$env:PICO_SDK_PATH` (PowerShell). If you see a path, you're good. **Otherwise** clone the SDK manually:
 
 ```bash
-mpremote connect COMx fs cp ecu/config_layer.py :config_layer.py
-mpremote connect COMx fs cp ecu/main.py :main.py
+cd /c/pico
+git clone https://github.com/raspberrypi/pico-sdk.git
+cd pico-sdk
+git submodule update --init --recursive
+export PICO_SDK_PATH=$(pwd)        # PowerShell: $env:PICO_SDK_PATH = (Get-Location).Path
+cd ..
+```
+
+Make this `PICO_SDK_PATH` permanent in your shell profile (`.bashrc`, `.zshrc`, or Windows "Environment Variables" GUI) — every new shell you open to run a build needs to see it.
+
+Then the MicroPython tree:
+
+```bash
+cd /c/pico
+git clone https://github.com/micropython/micropython.git
+cd micropython
+git checkout v1.24.1                                # known-good tag for this build (see note below)
+make -C mpy-cross                                   # builds the ahead-of-time cross-compiler used by the rp2 port
+make -C ports/rp2 BOARD=RPI_PICO2 submodules        # fetches only the submodules the rp2 port actually needs (tinyusb, lwip, btstack, cyw43-driver)
+```
+
+`make submodules` is the supported way to pull MicroPython's submodules for a specific port — it succeeds where `git submodule update --init --recursive` either pulls too much or breaks on submodule paths that have moved between releases. **Don't skip this step**; the build will otherwise fail at link time with missing-symbol errors from `tinyusb`.
+
+Version note: this build is known to work on MicroPython **v1.23.0** through **v1.24.x**. If you check out `master` and the build breaks, fall back to `git checkout v1.24.1` and try again. The user-C-module API itself has been stable since v1.21, but the rp2 port's CMake glue around `RPI_PICO2` and `pico_generate_pio_header` has changed minor things between releases.
+
+### Step 2 — Build the custom MicroPython firmware for the ECU Pico
+
+The ECU firmware is the standard MicroPython `rp2` port plus our `USER_C_MODULES`. The board target is **`RPI_PICO2`** (RP2350 / Pico 2). The build typically takes 1–3 minutes on a modern laptop, depending on `-j` parallelism.
+
+From the MicroPython root:
+
+```bash
+cd /c/pico/micropython/ports/rp2
+make BOARD=RPI_PICO2 \
+     USER_C_MODULES=/c/pico/bike2/ecu_v2/micropython/micropython.cmake \
+     -j8
+```
+
+PowerShell equivalent (run from a Pico developer shell — see Prerequisites):
+
+```powershell
+cd C:\pico\micropython\ports\rp2
+make BOARD=RPI_PICO2 `
+     USER_C_MODULES=C:/pico/bike2/ecu_v2/micropython/micropython.cmake `
+     -j8
+```
+
+Use forward slashes in the `USER_C_MODULES=` value even on Windows — CMake parses backslashes inside `make`-argument strings inconsistently and you can end up with a path that "looks right" but resolves to nothing.
+
+What this command does under the hood:
+
+- The MicroPython port build ingests our `micropython.cmake`, which adds `ecu_native.c` and every `.c` under `ecu_v2/c_core/` into the firmware image as an INTERFACE library named `usermod_ecu`.
+- `pico_generate_pio_header()` runs `pioasm` over `crank_capture.pio` and emits `crank_capture.pio.h` into the build directory; the include path is wired so `ecu_core.c` can `#include "crank_capture.pio.h"`.
+- `MP_REGISTER_MODULE(MP_QSTR_ecu, ecu_user_cmodule)` in `ecu_native.c` registers the module so `import ecu` works at runtime.
+- The link pulls in `pico_multicore`, `hardware_pio`, `hardware_irq`, `hardware_timer`, `hardware_gpio` from the SDK alongside `pico_stdlib` (the stock `rp2` port already links the latter).
+
+The output you want is:
+
+```
+ports/rp2/build-RPI_PICO2/firmware.uf2
+```
+
+Confirm the binary exists and is non-empty (typically ~600 KB for this build). Copy it somewhere convenient (e.g. `C:\pico\bike2\firmware.uf2`) so you can drag-and-drop it later without remembering the build path.
+
+If the build fails:
+- `make: command not found` (Windows) → you're not in a Pico developer shell. Open "Developer Command Prompt for Pico" or "Pico - Visual Studio Code" from the Start menu.
+- `PICO_SDK_PATH not set` → the env var didn't propagate to the shell you ran `make` in. `export PICO_SDK_PATH=…` (Bash) or `$env:PICO_SDK_PATH="…"` (PowerShell) and re-run. Make it permanent so this doesn't bite you on every new shell.
+- `Could not find a package configuration file provided by "pico-sdk"` → the SDK's submodules aren't checked out. `cd $PICO_SDK_PATH && git submodule update --init --recursive`.
+- `crank_capture.pio.h: No such file` → the PIO header generation failed. Check that `pioasm` is on PATH (it ships with the SDK build tools) and that the path passed in `USER_C_MODULES=` actually points at the file (`ls $USER_C_MODULES` should show `micropython.cmake`).
+- `undefined reference to alarm_pool_create_with_unused_hardware_alarm` → SDK older than 1.5. `cd $PICO_SDK_PATH && git fetch && git checkout 1.5.1 && git submodule update --init --recursive`.
+- `error: unknown type name 'absolute_time_t'` or other SDK type errors → the rp2 port grabbed an old vendored pico-sdk inside MicroPython that conflicts with your `PICO_SDK_PATH`. Re-run `make submodules` and re-build.
+- Build apparently succeeds but `firmware.uf2` is missing → check the very last lines of `make` output for a silent CMake error. Usually fixed by `rm -rf build-RPI_PICO2` and rebuilding from scratch.
+
+### Step 3 — Flash the ECU firmware
+
+1. **Identify the ECU Pico** before plugging it in (label its USB cable, or only plug one Pico in at a time). Mixing up which board you're flashing is the single most common mistake — the dash will refuse to boot if you flash the ECU firmware onto it (the dash code can't `import ecu`).
+2. Hold BOOTSEL on the ECU Pico, plug it in over USB while keeping BOOTSEL held until enumeration. It mounts as a mass-storage device named `RP2350` (or `RPI-RP2` on older bootloaders). Release BOOTSEL.
+3. Drag-and-drop `firmware.uf2` onto the drive. The drive disappears almost immediately — this is **normal** and means the firmware loaded; the Pico has rebooted into the new MicroPython image. It now enumerates as a serial device (USB CDC) instead of mass-storage.
+4. Find the new serial port (see "Finding COM ports" below for OS-specific commands). Common names: Windows `COM5` etc.; Linux `/dev/ttyACM0`; macOS `/dev/cu.usbmodem14101`.
+5. Verify the `ecu` native module is present:
+
+   ```bash
+   mpremote connect COMx exec "import ecu; print(dir(ecu))"
+   ```
+
+   `mpremote exec` raises Ctrl-C on connect, which interrupts any running script first; this is why it works even if the board already has a `main.py` from a previous attempt. The expected output is a Python list containing **at minimum** these names:
+
+   ```
+   start, stop, read_state, set_profile, drain_faults, set_inhibit,
+   request_reset, set_profile_crc16, get_profile_crc16,
+   SYNC_LOST, SYNC_SYNCING, SYNC_SYNCED,
+   IGN_INHIBIT, IGN_SAFE, IGN_PRECISION
+   ```
+
+   (Plus a few MicroPython-internal entries like `__name__`.)
+
+   - If `import ecu` raises `ImportError: no module named 'ecu'`, the firmware build did not actually include the user module. Go back to Step 2 and double-check the `USER_C_MODULES=` path resolved correctly. Common cause: a typo in the path, or building from a different shell where `USER_C_MODULES` got expanded incorrectly.
+   - If `mpremote` itself errors out with `cannot open <port>`, the port name is wrong, the cable is data-only (not all USB-C cables carry data), or some other process (Thonny / VS Code / a previous `mpremote repl`) still owns it.
+   - If `mpremote connect COMx repl` shows `>>>` but `import ecu` hangs, the board is in BOOTSEL mode (firmware never started); unplug, replug **without** holding BOOTSEL, and retry.
+
+### Step 4 — Deploy the ECU Python files
+
+Run these from the **bike2 repo root** (so the relative paths resolve):
+
+```bash
+cd /c/pico/bike2
+mpremote connect COMx fs cp ecu_v2/micropython/config_layer.py :config_layer.py
+mpremote connect COMx fs cp ecu_v2/micropython/main.py        :main.py
 mpremote connect COMx reset
 ```
 
-Replace COMx with ECU board serial port.
+PowerShell:
 
-## Deploy Dash Pico
-
-From repository root:
-
-```bash
-mpremote connect COMy fs cp dash/main.py :main.py
-mpremote connect COMy reset
+```powershell
+cd C:\pico\bike2
+mpremote connect COMx fs cp ecu_v2\micropython\config_layer.py :config_layer.py
+mpremote connect COMx fs cp ecu_v2\micropython\main.py        :main.py
+mpremote connect COMx reset
 ```
 
-Replace COMy with Dash board serial port.
+The leading colon (`:config_layer.py`) means "remote filesystem root" — `mpremote` interprets the LHS as host path and the RHS as device path. **Order matters**: deploy `config_layer.py` first (it's a pure module imported by `main.py`); if `main.py` boots before `config_layer.py` is on the device, the first run crashes with `ImportError` and you have to manually reset after the second deploy.
 
-## Deploy Legacy Single-Pico Variant
+After `reset`, `main.py` autoruns on boot. It:
+1. Loads `ecu_profile.json` if present (else uses defaults), validates and sanitizes it.
+2. Calls `ecu.start()` which inits the C real-time core, launches Core 1, and spins until Core 1 reports ready (typically <10 ms).
+3. Pushes the profile into the C shadow buffer.
+4. Opens UART0 at 230 400 baud (GP0 TX, GP1 RX) for telemetry to the dash.
+5. Enters the 50 Hz telemetry loop; concurrently the C core on Core 1 is already handling crank edges (PIO-driven), running the soft tick at 1 kHz, and arming hardware alarms for ignition.
+
+To watch the ECU live:
 
 ```bash
-mpremote connect COMz fs cp main.py :main.py
-mpremote connect COMz reset
+mpremote connect COMx repl
+```
+
+You'll see any `print(...)` output from `main.py`, including the "Config recovered from backup" line on first boot if applicable. `Ctrl-]` exits the REPL without resetting the board (so the script keeps running). `Ctrl-D` from inside the REPL soft-resets and re-runs `main.py` — useful after editing.
+
+If `main.py` crashes on boot and lands you at a `>>>` prompt, look at the traceback. Common causes:
+- `ImportError: no module named 'config_layer'` — Step 4 didn't actually copy the file. Re-run `mpremote ... fs cp ecu_v2/micropython/config_layer.py :config_layer.py`.
+- `RuntimeError: ECU C core already started` printed by main but no traceback — this is **not a crash**, it just means a previous `main()` call is still running. Reset (`Ctrl-D`) to restart cleanly.
+- Anything mentioning `g_ipc` / `seqlock` — almost certainly a build mismatch where `ecu_native.c` and `ipc.h` got out of step. Re-build the firmware (Step 2) and re-flash (Step 3).
+
+### Step 5 — Flash the Dash Pico (stock MicroPython)
+
+The Dash Pico runs unmodified MicroPython — there is **no** custom firmware on this side, so this step is just a download-and-drag.
+
+1. Download `RPI_PICO2-*.uf2` from https://micropython.org/download/RPI_PICO2/ — pick the latest **stable** release (v1.23.0 or later; this matches the firmware version Step 2 builds against). Avoid nightlies for a known-good baseline. Alternatively, you can build it yourself by re-running the Step 2 `make` command **without** the `USER_C_MODULES=` argument; the resulting `firmware.uf2` is functionally identical to the official download.
+2. Hold BOOTSEL on the Dash Pico, plug it in, drag-and-drop the .uf2 onto the `RP2350` mass-storage drive. The drive disappears as the Pico reboots into MicroPython.
+3. From the bike2 repo root, deploy the dash script:
+
+   ```bash
+   cd /c/pico/bike2
+   mpremote connect COMy fs cp dash/main.py :main.py
+   mpremote connect COMy reset
+   ```
+
+   (`COMy` is the dash's serial port — different from the ECU's `COMx`. With both boards plugged in, `mpremote connect list` shows them both.)
+
+After reset the dash boots into the main screen on the SSD1309 OLED. With no ECU connected (or before Step 6 wiring is done) you should see:
+- The RPM bar empty along the top.
+- `---- RPM` in the top half.
+- A large `0` and `km/h` in the middle.
+- `--.-*` in the bottom-left (advance display, link is lost so it shows the no-data placeholder).
+- `--C` in the bottom-right (no temperature data).
+- A small **6×6 status square at the middle-left edge (x=0, y=32)** — this is the ECU link badge. With no link it **blinks slowly** (≈4 Hz toggle between filled and outline). When the link is healthy it goes solid filled. When telemetry is stale (recent but old) it sits as an outline-only square.
+
+If the OLED stays blank or shows garbage, see "OLED freezes while Pico remains powered" in Troubleshooting; the most common causes are I²C wiring (SDA/SCL on GP0/GP1) and a SSD1306 module mis-sold as SSD1309 (clones often cap at 400 kHz, but our driver runs at 1 MHz — see the I²C clock note below in Step 6).
+
+### Step 6 — Wire and verify
+
+Wire the UART cross-over between the two boards (see the ECU↔Dash interconnect section). Both boards use **230 400 baud, 8-N-1, 3.3 V TTL**. Three wires total:
+
+| From | To |
+|---|---|
+| ECU GP0 (UART0 TX) | Dash GP5 (UART1 RX) |
+| ECU GP1 (UART0 RX) | Dash GP4 (UART1 TX) |
+| ECU GND | Dash GND |
+
+It's a **cross-over**: each TX goes to the other board's RX. If you accidentally tie TX-to-TX you won't damage anything (RP2350 GPIOs are 3.3 V CMOS, both drivers can sink/source) but no data flows. The shared GND must be a real conductor — both boards being plugged into the same USB host's GND happens to work on a desk but is not a substitute for the dedicated harness wire on a real bike.
+
+Power both boards (USB is fine for benchtop bring-up). Within ~1 second the dash should:
+- Switch the link badge from **slow-blink** to **solid filled** (link OK, telemetry arriving at 50 Hz).
+- Display `0 RPM` (or `---- RPM` very briefly during initial sync), Sync = LOST (no crank pulses on GP2 yet), Ignition = INHIBIT.
+- Bottom-left advance display shows `INH*` (inhibit, because no sync).
+
+If the badge stays slow-blinking forever: telemetry isn't reaching the dash. Check, in this order: (1) GND wired between the two boards, (2) crossover correct (ECU TX→Dash RX and ECU RX→Dash TX), (3) both Picos actually running their `main.py` (`mpremote ... repl` on each, look for output / no traceback).
+
+If the badge goes solid but RPM stays at 0 / Sync = LOST: that's **expected** until you wire a Hall sensor or signal generator to ECU GP2. The dash is showing valid telemetry; the engine just isn't turning.
+
+### Migration: replacing v1 firmware on a board that previously ran `ecu/main.py`
+
+The on-disk profile schema is **identical** between v1 and v2. The same `ecu_profile.json` and `ecu_profile.bak.json` files load cleanly into v2. To migrate:
+
+1. Build and flash the v2 .uf2 (Step 2 + Step 3) — this overwrites the MicroPython firmware including the v1 code. The board's filesystem (LittleFS in flash) is preserved across this flash on the rp2 port.
+2. Deploy the v2 `main.py` and `config_layer.py` (Step 4) — these overwrite v1's `main.py`/`config_layer.py`.
+3. Reset. v2 reads the existing profile via `load_profile_with_recovery()` and brings the C core up with it.
+
+If the filesystem ends up corrupted (rare; usually only happens if you nuke flash via picotool), `mpremote fs ls :` will fail. Erase fully and reinstall:
+
+```bash
+picotool erase --all
+# re-flash firmware.uf2 via BOOTSEL
+mpremote connect COMx fs cp ecu_v2/micropython/config_layer.py :config_layer.py
+mpremote connect COMx fs cp ecu_v2/micropython/main.py :main.py
+mpremote connect COMx reset
+```
+
+The C-side `ipc_install_default_profile()` defaults will apply until the dash pushes a config.
+
+### Reverting to legacy v1 (`ecu/`)
+
+This is supported but **not recommended on real engines** — see "Legacy v1 ECU" earlier in this document. To revert:
+
+1. Flash a stock RPI_PICO2 MicroPython .uf2 (drops the C native module).
+2. Deploy v1 files:
+
+   ```bash
+   mpremote connect COMx fs cp ecu/config_layer.py :config_layer.py
+   mpremote connect COMx fs cp ecu/main.py :main.py
+   mpremote connect COMx reset
+   ```
+
+The dash firmware is unchanged across the v1↔v2 boundary; the wire protocol is identical.
+
+### Finding COM ports
+
+- **Windows:** `mpremote connect list` enumerates Pico devices; or open Device Manager → Ports (COM & LPT) and look for "USB Serial Device" entries that appear/disappear as you plug each board.
+- **Linux:** `ls /dev/ttyACM*` after each plug-in. `mpremote connect /dev/ttyACM0`.
+- **macOS:** `ls /dev/cu.usbmodem*`. `mpremote connect /dev/cu.usbmodem14101`.
+
+A useful trick is to label each USB cable so you don't keep flashing the wrong board.
+
+### Building from a clean checkout (TL;DR)
+
+For a fresh clone on a machine that already has the Pico SDK:
+
+```bash
+git clone <bike2 repo>
+git clone https://github.com/micropython/micropython.git
+cd micropython && git submodule update --init --recursive lib/pico-sdk lib/tinyusb && make -C mpy-cross
+cd ports/rp2
+make BOARD=RPI_PICO2 \
+     USER_C_MODULES=$(realpath ../../../bike2/ecu_v2/micropython/micropython.cmake) \
+     -j8
+# flash build-RPI_PICO2/firmware.uf2 to ECU Pico via BOOTSEL
+mpremote connect <ecu-port> fs cp ../../../bike2/ecu_v2/micropython/config_layer.py :config_layer.py
+mpremote connect <ecu-port> fs cp ../../../bike2/ecu_v2/micropython/main.py        :main.py
+mpremote connect <ecu-port> reset
+# flash stock RPI_PICO2 MicroPython .uf2 to Dash Pico via BOOTSEL
+mpremote connect <dash-port> fs cp ../../../bike2/dash/main.py :main.py
+mpremote connect <dash-port> reset
 ```
 
 ## Runtime Configuration Workflow
@@ -1439,14 +1908,15 @@ Dash-only bench mode:
 
 ## Quick Bring-up Checklist (Dual Pico)
 
-1. Flash MicroPython to both boards.
-2. Deploy ECU files (ecu/main.py + ecu/config_layer.py).
-3. Deploy Dash file (dash/main.py).
-4. Wire UART cross-over and shared GND.
-5. Power Dash + OLED + buttons and verify menu/graphics.
-6. Power ECU and verify telemetry link indicator on Dash.
-7. Adjust one ECU setting from Dash and confirm response status updates.
-8. Commit and reboot ECU if flagged reboot-required.
+1. ECU Pico: flash the **custom MicroPython firmware** built from `ecu_v2/micropython/micropython.cmake` (see "Programming and Flashing" → Step 2). This is the only image that includes the `ecu` native module + PIO program; stock MicroPython will not work on the ECU side.
+2. Dash Pico: flash stock RPI_PICO2 MicroPython.
+3. Deploy ECU files (`ecu_v2/micropython/main.py` + `ecu_v2/micropython/config_layer.py`).
+4. Deploy Dash file (`dash/main.py`).
+5. Wire UART cross-over and shared GND.
+6. Power Dash + OLED + buttons and verify menu/graphics.
+7. Power ECU and verify telemetry link indicator on Dash.
+8. Adjust one ECU setting from Dash and confirm response status updates.
+9. Commit and reboot ECU if flagged reboot-required.
 
 ## Document Change Log
 
@@ -1472,6 +1942,14 @@ Dash-only bench mode:
   - Fixed `mul_div_smallint` to round toward zero for negative `advance_cd` values (previously used Python floor division, which biased negative advance by ~1 µs and made positive/negative advance asymmetric).
   - Removed redundant `sanitize_profile` calls on save: refactored `ecu/config_layer.py` to compute CRC over already-clean profiles via a new internal `_crc_for_clean` / `_atomic_write_clean` helper. `save_profile_pair` now sanitizes once and writes twice instead of three sanitizes per write × two writes.
   - Added worked-example math and ISR-throughput notes for N=90, 9000 RPM in the Timing and Control Model section. Added reference to filing-alignment offset correction by ±1 in `sync_tooth_index` (one tooth ≈ 4° at N=90).
+
+- 2026-05-01
+  - **Audit pass against code.** Read every file under `ecu_v2/` and `dash/main.py` and reconciled the manual to current code:
+    - Fault log section corrected: ECU internal fault ring is `ECU_FAULT_RING_LEN = 32` entries (SPSC, drop-on-full); the 8-entry-per-frame figure was a wire-protocol cap, not a ring depth. v2 uses a 100 ms producer-side coalesce window instead of v1's in-place increment-on-repeat.
+    - Documented the v2 1.5 s precision-mode re-entry lockout (`PRECISION_REENTRY_LOCKOUT_US` in `crank.c`) — added to the Scheduler invariants list and to the 2-stroke "missed-pulse handling" notes.
+    - Updated stale 2-stroke-section references that pointed at v1-only names: `arm_precision_from_edge` (now `scheduler_arm_for_reference`), `MAX_UNSCHED_STREAK_PRECISION` (now `ECU_RANGE_STREAK_LIMIT`), `ISR_OVERRUN_LIMIT_US = 100` (v1 only — v2 uses `ECU_ISR_OVERRUN_LIMIT_US = 30`), and added `ECU_NOISE_STREAK_LIMIT = 6` for the noise-streak path.
+    - Added `ecu_v2/CMakeLists.txt` to the Living Document Contract trigger list.
+    - Quick Bring-up Checklist updated to flash the custom ECU MicroPython firmware (USER_C_MODULES path) and deploy from `ecu_v2/micropython/`, not the legacy v1 paths.
 
 - 2026-04-27
   - **Architecture correction — reduction gear ratio.** The earlier assumption that the dry-clutch ring gear rotates at crank speed (1:1) was wrong. The ring gear is a REDUCTION gear and rotates slower than the crank by some 3:1..5:1 ratio (to be measured on engine arrival). Rewrote Sync Strategy, Crank Sensor, Mechanical Mounting, Timing and Control Model, default profile, and validation checklist to use `teeth_per_rev = physical_teeth / reduction_ratio`. Added an explicit Reduction-Ratio Measurement Procedure (mark crank + ring gear, rotate crank by hand, count crank revs per ring gear rev). Worked-example placeholder is now 84 physical teeth × 4:1 reduction → `teeth_per_rev = 21`, `tooth_min_us = 300`, `tooth_max_us = 8000`.

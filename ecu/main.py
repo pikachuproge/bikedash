@@ -1,9 +1,12 @@
 from machine import Pin, Timer, UART, disable_irq, enable_irq
+import machine
 from micropython import const
+from array import array
 import micropython
 import utime
 import ujson
 import config_layer
+import struct
 
 micropython.alloc_emergency_exception_buf(256)
 
@@ -14,7 +17,20 @@ micropython.alloc_emergency_exception_buf(256)
 # - UART0 TX to Dash RX: GP0 -> Dash GP5
 # - UART0 RX from Dash TX: GP1 <- Dash GP4
 # - Onboard debug LED: GP25
+# 1. Raise Voltage to 1.3V (POWMAN_VREG_CTRL at 0x40090000)
+# Value 14 corresponds to 1.30V.
+machine.mem32[0x40090000] = (machine.mem32[0x40090000] & ~(0xF << 4)) | (14 << 4)
 
+# 2. Set QMI Flash Divider manually
+# QMI base is 0x400d0000. M0 timing register is at offset 0x0c.
+# Bits [7:0] control the CLKDIV. Setting this to 4.
+QMI_BASE = 0x400d0000
+QMI_M0_TIMING = QMI_BASE + 0x0c
+current_val = machine.mem32[QMI_M0_TIMING]
+machine.mem32[QMI_M0_TIMING] = (current_val & ~0xFF) | 4
+
+# 3. Apply the overclock
+machine.freq(400_000_000)
 # -----------------------------
 # Pin / protocol configuration
 # -----------------------------
@@ -142,10 +158,17 @@ SAFE_PERIOD_MAX_US = const(150000)
 LEAD_GUARD_ON_US = const(200)
 LEAD_GUARD_FIRE_US = const(200)
 MIN_COIL_ON_US = const(400)
-LATE_SLACK_US = const(200)
+# Soft-IRQ scheduling under load can slip ~500-1000 us. 1500 us covers
+# realistic delays without flagging false stale events; genuine missed
+# fire windows still trip it.
+LATE_SLACK_US = const(1500)
 
+# 5000 Hz = 200 us scheduler resolution. Higher rates (10k+) overwhelm the
+# soft-IRQ queue when telemetry/config TX run, which is what was crashing
+# UART. 200 us gives ~5 deg timing accuracy at 6000 RPM, acceptable for
+# CDI ignition where coil rise time itself is several hundred us.
 SCHEDULER_TICK_HZ = const(5000)
-WATCHDOG_HZ = const(200)
+WATCHDOG_HZ = const(200)  # also runs the soft processor (rpm, sync state, faults)
 TELEMETRY_HZ = const(50)
 ALLOW_TIMER_FALLBACK = const(0)
 APPLY_MAX_RPM = const(300)
@@ -154,10 +177,9 @@ COMMIT_MAX_RPM = const(100)
 # Sync/precision anti-flap
 PRECISION_REENTRY_LOCKOUT_MS = const(1500)
 
-# ISR overrun threshold. With 80-100 teeth/rev at redline, tooth-to-tooth
-# spacing falls to ~60-80 us. Reference-edge ISRs additionally call
-# _interp_map twice and schedule_cycle_events. 100 us leaves headroom for
-# both the hot per-tooth path and the heavier per-rev reference path.
+# ISR overrun threshold. With the rewritten ISR (native, no method calls,
+# no set_fault inside) the reference-edge path runs ~30-50 us. 100 us gives
+# headroom for variance and any incidental Python overhead.
 ISR_OVERRUN_LIMIT_US = const(100)
 
 # Degradation/inhibit behavior
@@ -177,7 +199,6 @@ coil_pin = None
 safety_inhibit_pin = None
 led_pin = None
 uart = None
-crank_gear = None
 config_ingest = None
 
 sync_state = SYNC_LOST
@@ -209,9 +230,6 @@ config_tx_offset = 0
 rpm_value = 0
 crank_angle_deg = 0
 
-sync_soft_fails = 0
-unsched_streak = 0
-safe_bounds_fail_count = 0
 precision_lockout_until_ms = 0
 led_flash_until_ms = 0
 led_flash_period_ms = 0
@@ -225,6 +243,38 @@ advance_map_rpm_cache = ()
 advance_map_cd_cache = ()
 dwell_map_rpm_cache = ()
 dwell_map_us_cache = ()
+
+# --- Crank gear state (module globals; replaces CRANK_GEAR_LAYER class) ---
+# All gear state is held as module-level integers so the hard ISR can read
+# and write without going through Python method dispatch or attribute access.
+# Profile-derived configuration:
+g_teeth_per_rev = GEAR_DEFAULT_TEETH
+g_sync_tooth_index = GEAR_DEFAULT_SYNC_TOOTH
+g_tooth_min_us = GEAR_DEFAULT_MIN_US
+g_tooth_max_us = GEAR_DEFAULT_MAX_US
+g_debounce_us = GEAR_DEFAULT_DEBOUNCE_US
+g_sync_edges_to_lock = GEAR_DEFAULT_LOCK_EDGES
+g_mtr_x10 = GEAR_DEFAULT_MTR_X10
+g_safe_fire_delay_us = SAFE_FIRE_DELAY_US
+g_safe_dwell_us = SAFE_DWELL_US
+# Real-time gear state (written by ISR, read by soft processor):
+g_last_edge_us = 0
+g_last_dt_us = 0
+g_tooth_period_us = 0
+g_tooth_index = 0
+g_sync_edge_count = 0
+g_noise_count = 0
+g_range_count = 0
+g_isr_overrun_count = 0
+g_stale_event_count = 0
+
+# Cached ignition parameters — written by soft processor, read by hard ISR.
+# Pre-computing the full fire_delay (not just advance_cd) eliminates ALL
+# multiplication/division from the reference-edge ISR path. The ISR only
+# does ticks_add() and assignments — well under 50 µs even in pure Python.
+cached_advance_cd = 1200
+cached_dwell_us = DWELL_TARGET_US
+cached_fire_delay_us = 0  # 0 means "do not schedule" (unschedulable / no sync)
 pending_profile = None
 pending_commit = False
 pending_cfg_flags = CFG_FLAG_NONE
@@ -395,16 +445,13 @@ def set_fault(bit):
     global fault_bits, fault_log_used
     fault_bits |= bit
 
-    # Capture context atomically. disable_irq is harmless when already in a
-    # hard-IRQ path (returns 0, restored by hardware on ISR exit) and
-    # protects the flat arrays against concurrent ISR/timer callers.
+    # set_fault() now runs only from soft contexts (soft_process_tick and
+    # scheduler_tick); the hard ISR no longer calls it. disable_irq still
+    # protects against the crank_isr touching g_* state mid-snapshot.
     irq = disable_irq()
     rpm_now = rpm_value
-    cur_dt = 0
-    cur_avg = 0
-    if crank_gear is not None:
-        cur_dt = crank_gear.last_dt_us
-        cur_avg = crank_gear.tooth_period_us
+    cur_dt = g_last_dt_us
+    cur_avg = g_tooth_period_us
     now_ms = utime.ticks_ms()
 
     found = -1
@@ -479,137 +526,49 @@ def clamp(v, lo, hi):
     return v
 
 
-class CRANK_GEAR_LAYER:
-    def __init__(self, profile):
-        self.apply_profile(profile)
-        self.reset()
+def apply_gear_profile(profile):
+    """Copy profile-derived configuration into module globals consumed by the
+    hard ISR. Called at boot and whenever a runtime profile change applies."""
+    global g_teeth_per_rev, g_sync_tooth_index, g_tooth_min_us, g_tooth_max_us
+    global g_debounce_us, g_sync_edges_to_lock, g_mtr_x10
+    global g_safe_fire_delay_us, g_safe_dwell_us
+    g_teeth_per_rev = int(profile.get("teeth_per_rev", GEAR_DEFAULT_TEETH))
+    g_sync_tooth_index = int(profile.get("sync_tooth_index", GEAR_DEFAULT_SYNC_TOOTH))
+    g_tooth_min_us = int(profile.get("tooth_min_us", GEAR_DEFAULT_MIN_US))
+    g_tooth_max_us = int(profile.get("tooth_max_us", GEAR_DEFAULT_MAX_US))
+    g_debounce_us = int(profile.get("debounce_us", GEAR_DEFAULT_DEBOUNCE_US))
+    s = int(profile.get("sync_edges_to_lock", GEAR_DEFAULT_LOCK_EDGES))
+    if s < 1:
+        s = 1
+    g_sync_edges_to_lock = s
+    try:
+        ratio = float(profile.get("missing_tooth_ratio", 1.8))
+    except (TypeError, ValueError):
+        ratio = 1.8
+    rx10 = int(ratio * 10 + 0.5)
+    if rx10 < 12:
+        rx10 = 12
+    elif rx10 > 30:
+        rx10 = 30
+    g_mtr_x10 = rx10
+    g_safe_fire_delay_us = int(profile.get("safe_fire_delay_us", SAFE_FIRE_DELAY_US))
+    g_safe_dwell_us = int(profile.get("safe_dwell_us", SAFE_DWELL_US))
 
-    def apply_profile(self, profile):
-        self.teeth_per_rev = int(profile.get("teeth_per_rev", GEAR_DEFAULT_TEETH))
-        self.sync_tooth_index = int(profile.get("sync_tooth_index", GEAR_DEFAULT_SYNC_TOOTH))
-        self.tooth_min_us = int(profile.get("tooth_min_us", GEAR_DEFAULT_MIN_US))
-        self.tooth_max_us = int(profile.get("tooth_max_us", GEAR_DEFAULT_MAX_US))
-        self.debounce_us = int(profile.get("debounce_us", GEAR_DEFAULT_DEBOUNCE_US))
-        self.sync_edges_to_lock = int(profile.get("sync_edges_to_lock", GEAR_DEFAULT_LOCK_EDGES))
-        if self.sync_edges_to_lock < 1:
-            self.sync_edges_to_lock = 1
-        # Stored as ratio*10 so missing-tooth detection in on_edge stays in
-        # integer arithmetic for the hard-IRQ path.
-        try:
-            ratio = float(profile.get("missing_tooth_ratio", 1.8))
-        except (TypeError, ValueError):
-            ratio = 1.8
-        ratio_x10 = int(ratio * 10 + 0.5)
-        if ratio_x10 < 12:
-            ratio_x10 = 12
-        elif ratio_x10 > 30:
-            ratio_x10 = 30
-        self.missing_tooth_ratio_x10 = ratio_x10
 
-    def reset(self):
-        self.last_edge_us = 0
-        self.last_dt_us = 0
-        self.tooth_period_us = 0
-        self.rev_period_us = 0
-        self.tooth_index = 0
-        self.sync_edge_count = 0
-        self.noise_streak = 0
-        self.range_streak = 0
-        self.rpm = 0
-        self.crank_angle_deg = 0
-        self.sync_state = SYNC_LOST
-        self.last_error = GEAR_ERR_NONE
-
-    def force_unsynced(self, error_code):
-        self.reset()
-        self.last_error = error_code
-
-    def _update_period(self, dt_us):
-        if self.tooth_period_us == 0:
-            self.tooth_period_us = dt_us
-        else:
-            self.tooth_period_us = (self.tooth_period_us * 3 + dt_us) // 4
-        self.rev_period_us = self.tooth_period_us * self.teeth_per_rev
-        if self.rev_period_us > 0:
-            self.rpm = 60000000 // self.rev_period_us
-        else:
-            self.rpm = 0
-
-    def _update_angle(self):
-        self.crank_angle_deg = (self.tooth_index * 360) // self.teeth_per_rev
-
-    def on_edge(self, now_us):
-        if self.last_edge_us == 0:
-            self.last_edge_us = now_us
-            self.last_error = GEAR_ERR_NONE
-            return GEAR_EDGE_NONE
-
-        dt_us = utime.ticks_diff(now_us, self.last_edge_us)
-        if dt_us < self.debounce_us:
-            self.noise_streak += 1
-            if self.noise_streak >= GEAR_NOISE_STREAK_LIMIT:
-                self.force_unsynced(GEAR_ERR_NOISE)
-                return GEAR_EDGE_FAIL
-            return GEAR_EDGE_NONE
-
-        self.last_edge_us = now_us
-        self.last_dt_us = dt_us
-
-        # Missing-tooth detection MUST run before the range check, otherwise
-        # the gap interval (which is naturally > tooth_max_us) accumulates
-        # range_streak and triggers GEAR_ERR_RANGE instead of providing the
-        # sync reference.
-        if self.tooth_period_us > 0 and (dt_us * 10) > (self.tooth_period_us * self.missing_tooth_ratio_x10):
-            self.noise_streak = 0
-            self.range_streak = 0
-            self._update_period(dt_us)
-            if self.sync_state == SYNC_LOST:
-                self.sync_state = SYNC_SYNCING
-            self.tooth_index = self.sync_tooth_index
-            self._update_angle()
-            if self.sync_state == SYNC_SYNCING:
-                self.sync_edge_count += 1
-                if self.sync_edge_count >= self.sync_edges_to_lock:
-                    self.sync_state = SYNC_SYNCED
-            self.last_error = GEAR_ERR_NONE
-            return GEAR_EDGE_REFERENCE
-
-        if dt_us < self.tooth_min_us or dt_us > self.tooth_max_us:
-            self.range_streak += 1
-            if self.range_streak >= GEAR_RANGE_STREAK_LIMIT:
-                self.force_unsynced(GEAR_ERR_RANGE)
-                return GEAR_EDGE_FAIL
-            return GEAR_EDGE_NONE
-
-        self.noise_streak = 0
-        self.range_streak = 0
-        self._update_period(dt_us)
-
-        if self.sync_state == SYNC_LOST:
-            self.sync_state = SYNC_SYNCING
-
-        self.tooth_index += 1
-        if self.tooth_index >= self.teeth_per_rev:
-            self.tooth_index = 0
-        self._update_angle()
-
-        if self.sync_state == SYNC_SYNCING:
-            self.sync_edge_count += 1
-            if self.sync_edge_count >= self.sync_edges_to_lock:
-                self.sync_state = SYNC_SYNCED
-
-        self.last_error = GEAR_ERR_NONE
-        if self.tooth_index == self.sync_tooth_index:
-            return GEAR_EDGE_REFERENCE
-        return GEAR_EDGE_NONE
-
-    def on_timeout(self, now_us):
-        if self.last_edge_us == 0:
-            return False
-        if utime.ticks_diff(now_us, self.last_edge_us) > SYNC_TIMEOUT_US:
-            self.force_unsynced(GEAR_ERR_TIMEOUT)
-            return True
-        return False
+def reset_gear_state():
+    """Clear all real-time gear state. Called from soft processor on sync
+    loss / fault recovery; safe to call from soft IRQ context (the hard ISR
+    will see a consistent reset on its next edge because all fields are
+    integers and assignment is atomic)."""
+    global g_last_edge_us, g_last_dt_us, g_tooth_period_us, g_tooth_index
+    global g_sync_edge_count, g_noise_count, g_range_count
+    g_last_edge_us = 0
+    g_last_dt_us = 0
+    g_tooth_period_us = 0
+    g_tooth_index = 0
+    g_sync_edge_count = 0
+    g_noise_count = 0
+    g_range_count = 0
 
 
 def _interp_map(rpm, x_points, y_points):
@@ -703,11 +662,10 @@ def _safe_apply_window(commit_now=False):
 
 
 def _apply_profile_runtime(profile):
-    global active_profile, crank_gear
+    global active_profile
     irq_state = disable_irq()
     active_profile = profile
-    if crank_gear is not None:
-        crank_gear.apply_profile(profile)
+    apply_gear_profile(profile)
     _refresh_profile_caches(profile)
     enable_irq(irq_state)
 
@@ -850,212 +808,142 @@ def _apply_pending_config_if_safe():
     _queue_config_response(pending_cfg_seq, CFG_STATUS_OK, apply_flags, pending_cfg_text)
 
 
-def degrade_to_safe(bit):
-    global sync_state, ignition_mode, precision_lockout_until_ms, sync_soft_fails
-    set_fault(bit)
-    if sync_state == SYNC_SYNCED:
-        sync_state = SYNC_SYNCING
-    ignition_mode = IGN_MODE_SAFE
-    sync_soft_fails = 0
-    precision_lockout_until_ms = utime.ticks_add(utime.ticks_ms(), PRECISION_REENTRY_LOCKOUT_MS)
-    cancel_events()
-    force_coil_off()
+# Note: degrade_to_safe / transition_to_lost / schedule_cycle_events were
+# replaced by inline logic in soft_process_tick and crank_isr respectively.
 
 
-def transition_to_lost(bit):
-    global sync_state, ignition_mode, precision_lockout_until_ms, sync_soft_fails
-    global rpm_value, crank_angle_deg
-    set_fault(bit)
-    sync_state = SYNC_LOST
-    ignition_mode = IGN_MODE_INHIBIT
-    sync_soft_fails = 0
-    rpm_value = 0
-    crank_angle_deg = 0
-    precision_lockout_until_ms = utime.ticks_add(utime.ticks_ms(), PRECISION_REENTRY_LOCKOUT_MS)
-    if crank_gear is not None:
-        crank_gear.force_unsynced(GEAR_ERR_NONE)
-    cancel_events()
-    force_coil_off()
-
-
-def schedule_cycle_events(now_us, fire_delay_us, dwell_us):
-    global fire_armed, fire_time_us, fire_cycle_id
-    global on_armed, on_time_us, on_cycle_id
-    global unsched_streak
-
-    if fire_delay_us <= 0:
-        set_fault(FAULT_UNSCHEDULABLE)
-        unsched_streak += 1
-        return False
-
-    fire_time = utime.ticks_add(now_us, fire_delay_us)
-    on_time = utime.ticks_add(fire_time, -dwell_us)
-
-    lead_on = utime.ticks_diff(on_time, now_us)
-    lead_fire = utime.ticks_diff(fire_time, now_us)
-    coil_on_width = utime.ticks_diff(fire_time, on_time)
-
-    if lead_on < LEAD_GUARD_ON_US or lead_fire < LEAD_GUARD_FIRE_US or coil_on_width < MIN_COIL_ON_US:
-        set_fault(FAULT_UNSCHEDULABLE)
-        unsched_streak += 1
-        return False
-
-    irq = disable_irq()
-    fire_time_us = fire_time
-    fire_cycle_id = cycle_id
-    fire_armed = True
-
-    on_time_us = on_time
-    on_cycle_id = cycle_id
-    on_armed = True
-    enable_irq(irq)
-
-    unsched_streak = 0
-    return True
-
-
-def arm_precision_from_edge(now_us, dt_us):
-    rpm_now = rpm_value
-    dwell_eff = clamp(_interp_map(rpm_now, dwell_map_rpm_cache, dwell_map_us_cache), DWELL_MIN_US, DWELL_MAX_US)
-    advance_cd = _interp_map(rpm_now, advance_map_rpm_cache, advance_map_cd_cache)
-
-    # Final timestamp is edge-anchored to the measured interval for this cycle.
-    fire_delay = dt_us - mul_div_smallint(dt_us, advance_cd, 36000)
-    return schedule_cycle_events(now_us, fire_delay, dwell_eff)
-
-
-def arm_safe_from_edge(now_us, dt_us):
-    global safe_bounds_fail_count
-
-    if dt_us < SAFE_PERIOD_MIN_US or dt_us > SAFE_PERIOD_MAX_US:
-        set_fault(FAULT_UNSCHEDULABLE)
-        safe_bounds_fail_count += 1
-        return False
-
-    safe_bounds_fail_count = 0
-    safe_delay = SAFE_FIRE_DELAY_US
-    safe_dwell = SAFE_DWELL_US
-    if active_profile is not None:
-        safe_delay = int(active_profile.get("safe_fire_delay_us", SAFE_FIRE_DELAY_US))
-        safe_dwell = int(active_profile.get("safe_dwell_us", SAFE_DWELL_US))
-    dwell_eff = clamp(safe_dwell, DWELL_MIN_US, DWELL_MAX_US)
-    return schedule_cycle_events(now_us, safe_delay, dwell_eff)
-
-
+@micropython.native
 def crank_isr(pin):
-    global sync_state, rpm_value, crank_angle_deg
-    global cycle_id, ignition_mode, unsched_streak, validity_bits
+    """Hard-IRQ crank edge handler. Does the absolute minimum:
+       - capture timestamp + compute dt
+       - debounce (just count; soft tick decides if it's a fault)
+       - missing-tooth gap detection (the engine's sync reference)
+       - range check (count out-of-range; soft tick decides if it's a fault)
+       - normal tooth advance + wrap detection
+       - update tooth-period EMA
+       - on reference edges: schedule fire/on events using cached_fire_delay_us
+       - count ISR overruns; soft tick logs the fault
 
-    isr_start = utime.ticks_us()
-
-    if safety_inhibit_pin is not None and safety_inhibit_pin.value() == 0:
-        set_fault(FAULT_SAFETY_INHIBIT)
-        transition_to_lost(FAULT_SAFETY_INHIBIT)
-        return
+    Everything else (sync state machine, RPM, validity, ALL fault setting,
+    safety-inhibit reset cascade, advance/dwell map lookups) lives in
+    soft_process_tick which runs at WATCHDOG_HZ.
+    """
+    global g_last_edge_us, g_last_dt_us, g_tooth_period_us, g_tooth_index
+    global g_sync_edge_count, g_noise_count, g_range_count, g_isr_overrun_count
+    global cycle_id, fire_armed, fire_time_us, fire_cycle_id
+    global on_armed, on_time_us, on_cycle_id
 
     now_us = utime.ticks_us()
 
-    if crank_gear is None:
-        transition_to_lost(FAULT_EDGE_PLAUSIBILITY)
+    last = g_last_edge_us
+    if last == 0:
+        g_last_edge_us = now_us
         return
 
-    edge_state = crank_gear.on_edge(now_us)
-
-    if edge_state == GEAR_EDGE_FAIL:
-        err = crank_gear.last_error
-        if err == GEAR_ERR_TIMEOUT:
-            transition_to_lost(FAULT_SYNC_TIMEOUT)
-        elif err == GEAR_ERR_NOISE:
-            transition_to_lost(FAULT_UNSTABLE_SYNC)
-        else:
-            transition_to_lost(FAULT_EDGE_PLAUSIBILITY)
-        validity_bits = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
-        isr_elapsed = utime.ticks_diff(utime.ticks_us(), isr_start)
-        if isr_elapsed > ISR_OVERRUN_LIMIT_US:
-            set_fault(FAULT_ISR_OVERRUN)
+    dt = utime.ticks_diff(now_us, last)
+    if dt < g_debounce_us:
+        g_noise_count += 1
         return
 
-    sync_state = crank_gear.sync_state
-    rpm_value = crank_gear.rpm
-    crank_angle_deg = crank_gear.crank_angle_deg
+    g_last_edge_us = now_us
+    g_last_dt_us = dt
 
-    if sync_state == SYNC_SYNCED and utime.ticks_diff(utime.ticks_ms(), precision_lockout_until_ms) < 0:
-        sync_state = SYNC_SYNCING
+    period = g_tooth_period_us
+    is_ref = 0
 
-    if rpm_value > 0 and sync_state != SYNC_LOST:
-        validity = VALID_RPM | VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+    # Missing-tooth gap MUST be checked before the range bounds, otherwise
+    # the gap interval would always exceed tooth_max_us and trip range_count.
+    if period > 0 and (dt * 10) > (period * g_mtr_x10):
+        is_ref = 1
+        g_tooth_index = g_sync_tooth_index
+        g_range_count = 0
+    elif dt < g_tooth_min_us or dt > g_tooth_max_us:
+        # Out-of-range: count it; soft tick triggers FAULT_EDGE_PLAUSIBILITY
+        # and resets gear state once the streak crosses GEAR_RANGE_STREAK_LIMIT.
+        g_range_count += 1
+        return
     else:
-        validity = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+        g_range_count = 0
+        idx = g_tooth_index + 1
+        if idx >= g_teeth_per_rev:
+            idx = 0
+        g_tooth_index = idx
+        if idx == g_sync_tooth_index:
+            is_ref = 1
 
-    if sync_state == SYNC_LOST:
-        ignition_mode = IGN_MODE_INHIBIT
-        cancel_events()
-        force_coil_off()
+    # EMA period: (period*3 + dt) / 4. Shift by 2 = divide by 4.
+    if period == 0:
+        g_tooth_period_us = dt
+    else:
+        g_tooth_period_us = ((period * 3) + dt) >> 2
 
-    if edge_state == GEAR_EDGE_REFERENCE:
-        dt_us = crank_gear.rev_period_us
+    sec = g_sync_edge_count
+    if sec < g_sync_edges_to_lock:
+        g_sync_edge_count = sec + 1
+
+    if is_ref:
         cycle_id = (cycle_id + 1) & COUNTER_MASK
+        ig = ignition_mode
+        if ig == IGN_MODE_PRECISION:
+            fd = cached_fire_delay_us
+            dw = cached_dwell_us
+            if fd > 0:
+                ft = utime.ticks_add(now_us, fd)
+                ot = utime.ticks_add(ft, -dw)
+                fire_time_us = ft
+                fire_cycle_id = cycle_id
+                fire_armed = True
+                on_time_us = ot
+                on_cycle_id = cycle_id
+                on_armed = True
+        elif ig == IGN_MODE_SAFE:
+            ft = utime.ticks_add(now_us, g_safe_fire_delay_us)
+            ot = utime.ticks_add(ft, -g_safe_dwell_us)
+            fire_time_us = ft
+            fire_cycle_id = cycle_id
+            fire_armed = True
+            on_time_us = ot
+            on_cycle_id = cycle_id
+            on_armed = True
+        # IGN_MODE_INHIBIT: do not schedule
 
-        if dt_us <= 0:
-            transition_to_lost(FAULT_UNSCHEDULABLE)
-            validity = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
-        elif sync_state == SYNC_SYNCED:
-            ignition_mode = IGN_MODE_PRECISION
-            if not arm_precision_from_edge(now_us, dt_us):
-                if unsched_streak >= MAX_UNSCHED_STREAK_PRECISION:
-                    degrade_to_safe(FAULT_UNSCHEDULABLE)
-        elif sync_state == SYNC_SYNCING:
-            ignition_mode = IGN_MODE_SAFE
-            if not arm_safe_from_edge(now_us, dt_us):
-                if safe_bounds_fail_count >= MAX_SAFE_BOUNDS_FAIL or unsched_streak >= MAX_UNSCHED_STREAK_SAFE:
-                    transition_to_lost(FAULT_UNSCHEDULABLE)
-        else:
-            ignition_mode = IGN_MODE_INHIBIT
-            cancel_events()
-            force_coil_off()
-
-    # Update validity atomically after edge processing.
-    validity_bits = validity
-
-    isr_elapsed = utime.ticks_diff(utime.ticks_us(), isr_start)
-    if isr_elapsed > ISR_OVERRUN_LIMIT_US:
-        set_fault(FAULT_ISR_OVERRUN)
+    elapsed = utime.ticks_diff(utime.ticks_us(), now_us)
+    if elapsed > ISR_OVERRUN_LIMIT_US:
+        g_isr_overrun_count += 1
 
 
+@micropython.native
 def scheduler_tick(timer):
-    global fire_armed, on_armed, spark_counter, coil_active
+    """Soft-IRQ scheduler tick: fires armed coil-on / coil-off events.
+       set_fault() is safe here (soft context) but each call costs ~30 us,
+       so we only call it when stale_event_count crosses zero on the next
+       soft_process_tick — see g_stale_event_count below."""
+    global fire_armed, on_armed, spark_counter, coil_active, g_stale_event_count
 
     now_us = utime.ticks_us()
     fire_processed = False
-    fire_due = False
-    fire_due_time = 0
-    fire_due_cycle = 0
 
-    # FIRE_OFF has highest priority and OFF is dominant when timestamps collide.
     irq = disable_irq()
     if fire_armed and event_due(now_us, fire_time_us):
         fire_due = True
         fire_due_time = fire_time_us
         fire_due_cycle = fire_cycle_id
         fire_armed = False
+    else:
+        fire_due = False
+        fire_due_time = 0
+        fire_due_cycle = 0
     enable_irq(irq)
 
     if fire_due:
         late = event_late_by(now_us, fire_due_time)
-        if late > LATE_SLACK_US:
-            set_fault(FAULT_STALE_EVENT)
-            force_coil_off()
-        elif fire_due_cycle != cycle_id or sync_state == SYNC_LOST or ignition_mode == IGN_MODE_INHIBIT:
-            set_fault(FAULT_STALE_EVENT)
+        if late > LATE_SLACK_US or fire_due_cycle != cycle_id or sync_state == SYNC_LOST or ignition_mode == IGN_MODE_INHIBIT:
+            g_stale_event_count += 1
             force_coil_off()
         else:
             force_coil_off()
             spark_counter = (spark_counter + 1) & COUNTER_MASK
         fire_processed = True
-
-    on_due = False
-    on_due_time = 0
-    on_due_cycle = 0
 
     irq = disable_irq()
     if on_armed and event_due(now_us, on_time_us):
@@ -1063,18 +951,16 @@ def scheduler_tick(timer):
         on_due_time = on_time_us
         on_due_cycle = on_cycle_id
         on_armed = False
+    else:
+        on_due = False
+        on_due_time = 0
+        on_due_cycle = 0
     enable_irq(irq)
 
     if on_due:
         late = event_late_by(now_us, on_due_time)
-        if late > LATE_SLACK_US:
-            set_fault(FAULT_STALE_EVENT)
-            force_coil_off()
-        elif on_due_cycle != cycle_id or sync_state == SYNC_LOST or ignition_mode == IGN_MODE_INHIBIT:
-            set_fault(FAULT_STALE_EVENT)
-            force_coil_off()
-        elif fire_processed:
-            set_fault(FAULT_STALE_EVENT)
+        if late > LATE_SLACK_US or on_due_cycle != cycle_id or sync_state == SYNC_LOST or ignition_mode == IGN_MODE_INHIBIT or fire_processed:
+            g_stale_event_count += 1
             force_coil_off()
         else:
             if coil_pin is not None:
@@ -1082,11 +968,168 @@ def scheduler_tick(timer):
             coil_active = 1
 
 
-def watchdog_tick(timer):
-    now_us = utime.ticks_us()
+def soft_process_tick(timer):
+    """Soft-IRQ tick at WATCHDOG_HZ (200 Hz / 5 ms). Owns:
+       - sync timeout detection (replaces watchdog_tick)
+       - sync state machine (LOST / SYNCING / SYNCED + precision lockout)
+       - RPM, crank_angle_deg, validity_bits
+       - safety inhibit kill cascade
+       - fault recognition (range / noise / overrun / stale-event / unschedulable)
+       - cached_fire_delay_us computation (the precise advance math the ISR uses)
+       - cached_advance_cd / cached_dwell_us map lookups
 
-    if crank_gear is not None and crank_gear.on_timeout(now_us):
-        transition_to_lost(FAULT_SYNC_TIMEOUT)
+    Running every 5 ms gives sync state changes a worst-case latency that's
+    well below the SYNC_TIMEOUT_US threshold and orders of magnitude below
+    a human-perceivable response."""
+    global rpm_value, sync_state, ignition_mode, validity_bits, crank_angle_deg
+    global cached_advance_cd, cached_dwell_us, cached_fire_delay_us
+    global precision_lockout_until_ms
+    global g_isr_overrun_count, g_stale_event_count
+
+    irq = disable_irq()
+    period = g_tooth_period_us
+    last_edge = g_last_edge_us
+    sync_edges = g_sync_edge_count
+    overrun = g_isr_overrun_count
+    g_isr_overrun_count = 0
+    stale = g_stale_event_count
+    g_stale_event_count = 0
+    range_cnt = g_range_count
+    noise_cnt = g_noise_count
+    tooth_idx = g_tooth_index
+    enable_irq(irq)
+
+    now_us = utime.ticks_us()
+    now_ms = utime.ticks_ms()
+
+    # Safety inhibit (active-low) — kill ignition immediately
+    if safety_inhibit_pin is not None and safety_inhibit_pin.value() == 0:
+        cached_fire_delay_us = 0
+        cancel_events()
+        force_coil_off()
+        ignition_mode = IGN_MODE_INHIBIT
+        sync_state = SYNC_LOST
+        rpm_value = 0
+        validity_bits = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+        reset_gear_state()
+        set_fault(FAULT_SAFETY_INHIBIT)
+        return
+
+    # Sync timeout (no edges for >250 ms)
+    if last_edge != 0 and utime.ticks_diff(now_us, last_edge) > SYNC_TIMEOUT_US:
+        cached_fire_delay_us = 0
+        cancel_events()
+        force_coil_off()
+        ignition_mode = IGN_MODE_INHIBIT
+        sync_state = SYNC_LOST
+        rpm_value = 0
+        crank_angle_deg = 0
+        precision_lockout_until_ms = utime.ticks_add(now_ms, PRECISION_REENTRY_LOCKOUT_MS)
+        validity_bits = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+        reset_gear_state()
+        set_fault(FAULT_SYNC_TIMEOUT)
+        return
+
+    # Range / noise streaks crossed limit — gear is desynced
+    if range_cnt >= GEAR_RANGE_STREAK_LIMIT:
+        cached_fire_delay_us = 0
+        cancel_events()
+        force_coil_off()
+        ignition_mode = IGN_MODE_INHIBIT
+        sync_state = SYNC_LOST
+        rpm_value = 0
+        precision_lockout_until_ms = utime.ticks_add(now_ms, PRECISION_REENTRY_LOCKOUT_MS)
+        validity_bits = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+        reset_gear_state()
+        set_fault(FAULT_EDGE_PLAUSIBILITY)
+        return
+
+    if noise_cnt >= GEAR_NOISE_STREAK_LIMIT:
+        cached_fire_delay_us = 0
+        cancel_events()
+        force_coil_off()
+        ignition_mode = IGN_MODE_INHIBIT
+        sync_state = SYNC_LOST
+        rpm_value = 0
+        precision_lockout_until_ms = utime.ticks_add(now_ms, PRECISION_REENTRY_LOCKOUT_MS)
+        validity_bits = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+        reset_gear_state()
+        set_fault(FAULT_UNSTABLE_SYNC)
+        return
+
+    # Compute RPM from EMA tooth period
+    if period > 0:
+        rev_period = period * g_teeth_per_rev
+        if rev_period > 0:
+            rpm_value = 60000000 // rev_period
+        else:
+            rpm_value = 0
+    else:
+        rpm_value = 0
+
+    crank_angle_deg = (tooth_idx * 360) // g_teeth_per_rev if g_teeth_per_rev > 0 else 0
+
+    # Sync state machine: enough edges + valid period == SYNCED, else SYNCING / LOST
+    if period == 0:
+        sync_state = SYNC_LOST
+    elif sync_edges >= g_sync_edges_to_lock:
+        sync_state = SYNC_SYNCED
+        if utime.ticks_diff(now_ms, precision_lockout_until_ms) < 0:
+            sync_state = SYNC_SYNCING
+    else:
+        sync_state = SYNC_SYNCING
+
+    # Ignition mode mirrors sync state
+    if sync_state == SYNC_LOST:
+        ignition_mode = IGN_MODE_INHIBIT
+    elif sync_state == SYNC_SYNCING:
+        ignition_mode = IGN_MODE_SAFE
+    else:
+        ignition_mode = IGN_MODE_PRECISION
+
+    # Validity bits
+    if rpm_value > 0 and sync_state != SYNC_LOST:
+        validity_bits = VALID_RPM | VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+    else:
+        validity_bits = VALID_SYNC | VALID_IGN_MODE | VALID_FAULTS | VALID_IGN_OUT
+
+    # Faults observed in the last tick
+    if overrun > 0:
+        set_fault(FAULT_ISR_OVERRUN)
+    if stale > 0:
+        set_fault(FAULT_STALE_EVENT)
+
+    # Refresh cached advance / dwell from the maps
+    rpm_now = rpm_value
+    if rpm_now > 0 and advance_map_rpm_cache and advance_map_cd_cache:
+        cached_advance_cd = _interp_map(rpm_now, advance_map_rpm_cache, advance_map_cd_cache)
+    if dwell_map_rpm_cache and dwell_map_us_cache:
+        dw = _interp_map(rpm_now, dwell_map_rpm_cache, dwell_map_us_cache)
+        cached_dwell_us = clamp(dw, DWELL_MIN_US, DWELL_MAX_US)
+    else:
+        cached_dwell_us = clamp(DWELL_TARGET_US, DWELL_MIN_US, DWELL_MAX_US)
+
+    # Compute the precise fire_delay the ISR will use on the next reference
+    # edge. rev_period is the tooth-period EMA × teeth_per_rev — accurate to
+    # within a fraction of a percent at steady RPM and changing slowly enough
+    # that a 5 ms refresh interval is much finer than needed.
+    if period > 0 and ignition_mode == IGN_MODE_PRECISION:
+        rev_period = period * g_teeth_per_rev
+        fire_delay = rev_period - mul_div_smallint(rev_period, cached_advance_cd, 36000)
+        if (fire_delay > LEAD_GUARD_FIRE_US
+                and (fire_delay - cached_dwell_us) > LEAD_GUARD_ON_US
+                and cached_dwell_us >= MIN_COIL_ON_US):
+            cached_fire_delay_us = fire_delay
+        else:
+            cached_fire_delay_us = 0
+            set_fault(FAULT_UNSCHEDULABLE)
+    else:
+        cached_fire_delay_us = 0
+
+
+# Backwards-compat alias: existing init_hardware sets up watchdog_timer with
+# this name. Keep the name pointing at the new soft processor.
+watchdog_tick = soft_process_tick
 
 
 def telemetry_tick(timer):
@@ -1296,7 +1339,7 @@ def load_boot_config_profile():
 
 
 def init_hardware():
-    global crank_pin, coil_pin, safety_inhibit_pin, led_pin, uart, crank_gear, config_ingest
+    global crank_pin, coil_pin, safety_inhibit_pin, led_pin, uart, config_ingest
     global scheduler_timer, watchdog_timer, telemetry_timer
 
     coil_pin = Pin(COIL_PIN, Pin.OUT)
@@ -1306,7 +1349,8 @@ def init_hardware():
     led_pin = Pin(LED_PIN, Pin.OUT)
     led_set(0)
 
-    crank_gear = CRANK_GEAR_LAYER(active_profile)
+    apply_gear_profile(active_profile)
+    reset_gear_state()
 
     crank_pin = Pin(CRANK_PIN, Pin.IN, Pin.PULL_DOWN)
     try:

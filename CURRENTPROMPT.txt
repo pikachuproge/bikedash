@@ -1,0 +1,66 @@
+ add_alarm_at() returns an alarm_id_t that you must save and pass to cancel_alarm(). I'm passing literal 0 and 1
+  (ALARM_ID_DWELL_ON etc.), which are not valid alarm IDs. Fix: capture the return values into sch.dwell_on_alarm_id /
+  sch.fire_alarm_id and cancel with those.
+
+  2. crank.c — PIO ISR batch-drain corrupts dt for bursts.
+  The drain loop processes every queued FIFO entry with the same entry_us timestamp. The second entry sees dt = entry_us
+   - entry_us = 0, fails the debounce check, and increments noise_streak. Two edges arriving in the same ISR window =
+  false noise fault. Fix: either pop only one entry per ISR (the FIFO-not-empty IRQ is level-triggered, it'll re-fire
+  immediately), or have the PIO program actually push a hardware timestamp instead of just a marker.
+
+  3. ecu_core.c — Core 1 does nothing useful.
+  On RP2350 the NVIC is per-core: interrupts fire on whichever core called irq_set_enabled(). I call it from
+  ecu_core_start(), which runs on Core 0 (the MP main thread), so the PIO ISR + repeating timer ISR both fire on Core 0
+  — same core as MicroPython. Core 1 just sits in WFI. The architecture diagram is wrong about "C on Core 1." Fix: move
+  irq_set_*, add_repeating_timer_us, and alarm_pool_* calls inside core1_entry(), after multicore_launch_core1().
+
+  4. ecu_core.c stop() — WFI on Core 1 never wakes.
+  multicore_fifo_push_blocking(0) raises SIO_IRQ_PROC1 on Core 1, but I never enable it. WFI waits for an enabled
+  interrupt. Fix: either enable SIO_IRQ_PROC1 on Core 1 entry, or use __sev() from Core 0 (and SEVONPEND) to wake
+  without needing an enabled IRQ.
+
+  Probably-broken-on-build
+
+  5. ecu_native.c — MP API names may not match current MicroPython.
+  mp_obj_dict_get, mp_obj_is_dict_or_ordereddict, and the single-arg form of MP_REGISTER_MODULE are version-dependent.
+  Current MicroPython uses mp_map_lookup(&MP_OBJ_TO_PTR(dict)->map, key, MP_MAP_LOOKUP) and mp_obj_is_type(obj,
+  &mp_type_dict). Fix: swap to the canonical helpers and verify MP_REGISTER_MODULE arity against your MP checkout (newer
+   = 2 args, older = 3).
+
+  6. ipc.h seqlock ordering is too weak for cross-core.
+  fetch_add(1, memory_order_release) releases prior ops, not subsequent ones. The standard seqlock pattern needs an
+  explicit atomic_thread_fence(memory_order_release) between the seq-bump and the body writes (and an acquire fence on
+  the reader side after sampling seq). Single-core this is mostly academic; with the C core actually on Core 1 (after
+  fixing #3) the reader on Core 0 could see torn values. Fix: add explicit fences in ipc_telemetry_begin_write /
+  end_write and mirror in the reader.
+
+  Minor / cosmetic
+
+  7. crank.c — pio_interrupt_clear() is wrong here; FIFO-not-empty IRQs auto-clear on FIFO drain. Harmless but
+  misleading.
+
+  8. crank_capture.pio — pio_get_gpio_base() only exists in newer SDKs. For GP2 with PIO0 it returns 0 anyway, so the
+  call is pointless. Just gpio_set_dir(pin, GPIO_IN).
+
+  9. crank.h — crank_set_pio() is declared extern in ecu_core.c but missing from the header.
+
+  8. crank_capture.pio — pio_get_gpio_base() only exists in newer SDKs. For GP2 with PIO0 it returns 0 anyway, so the
+  call is pointless. Just gpio_set_dir(pin, GPIO_IN).
+
+  9. crank.h — crank_set_pio() is declared extern in ecu_core.c but missing from the header.
+
+  10. main.py — import struct is unused.
+
+  What's actually fine
+
+  - IPC layout, fault ring SPSC math, profile shadow-and-commit pattern.
+  - The decoder logic itself (missing-tooth-before-range, EMA, sync state machine) is a faithful port of v1.
+  - Ignition / safety GPIO bring-up order (low-before-anything).
+  - Wire protocol in main.py is byte-identical to v1.
+  - advance_map.c interpolation.
+  - The migration plan and bench gates in ARCHITECTURE.md.
+
+  Recommendation
+
+  Fix #1, #2, #3, #4 before any build attempt — those are blocking. #5 you'll discover at first compile. #6 fix
+  opportunistically when you do #3 (they're related). The rest can wait.

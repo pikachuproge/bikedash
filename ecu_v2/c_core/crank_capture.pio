@@ -1,0 +1,73 @@
+; -----------------------------------------------------------------------
+; crank_capture.pio
+;
+; ONE state machine. Watches one input pin (configured to GP2 — the Hall
+; sensor digital output). On every rising edge, pushes a marker word into
+; the RX FIFO and asserts the SM IRQ.
+;
+; The CPU IRQ handler samples the 64-bit system timer at the top of its
+; entry (see crank.c crank_pio_isr). We do NOT timestamp inside the PIO
+; itself because:
+;   - PIO timer samples cost extra instructions (more cycles per edge,
+;     worse worst-case throughput)
+;   - The ambiguity introduced by IRQ entry latency (~1 µs at 150 MHz) is
+;     below our 10 µs scheduling resolution
+;   - Keeping the program tiny (under .wrap) means the SM cannot fall
+;     behind even at the maximum sustained tooth rate (5 kHz)
+;
+; If sub-µs jitter ever becomes the limit, this program can be replaced
+; with a hardware-timestamping variant; the FIFO contract (one word per
+; edge) stays the same.
+; -----------------------------------------------------------------------
+
+.program crank_capture
+
+.wrap_target
+    wait 1 pin 0     ; wait for input pin = 1 (rising edge or already-high)
+    in   pins, 1     ; consume one bit (always 1 here) into ISR shift register
+    push noblock     ; push ISR contents to RX FIFO; if FIFO full, drop
+    wait 0 pin 0     ; wait for input pin = 0 (so the next 'wait 1' catches a NEW rising edge)
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+/* Init helper used by ecu_core.c. Configures the SM, sets the input pin,
+ * and wires the FIFO IRQ. The SM clock divider is set to a large value —
+ * the PIO program is dominated by the wait-for-edge instructions, not by
+ * its own clock rate, so we run it slow to save power and reduce noise
+ * coupling on the PIO clock domain. */
+static inline void crank_capture_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = crank_capture_program_get_default_config(offset);
+
+    /* Input pin */
+    sm_config_set_in_pins(&c, pin);
+    pio_gpio_init(pio, pin);
+    gpio_set_dir(pin, GPIO_IN);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+
+    /* Pin debouncing is the hardware conditioner's job upstream of GP2;
+     * we don't add software debounce here because the crank decoder
+     * applies a configurable debounce_us in C. */
+
+    /* Slow clock — 1 MHz. The wait instructions sample the input every
+     * PIO cycle so this still resolves edges to ~1 µs precision. */
+    float sys_hz = (float)clock_get_hz(clk_sys);
+    float div = sys_hz / 1.0e6f;
+    if (div < 1.0f) div = 1.0f;
+    sm_config_set_clkdiv(&c, div);
+
+    /* RX FIFO only; we never TX from here. Joining gives 8 entries which
+     * is far more than we need (1-2 in flight typical) and absorbs any
+     * IRQ tail latency. */
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    /* Autopush off — we use explicit `push noblock` so we can drop on
+     * overflow rather than stall the SM. */
+    sm_config_set_in_shift(&c, false /* shift_right */, false /* autopush */, 32);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
